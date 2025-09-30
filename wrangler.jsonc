@@ -66,8 +66,8 @@
 			"max_instances": 2900,
             // ATTENTION: Altering instance_type value will have no effect. Please use the SANDBOX_INSTANCE_TYPE var instead.
             "instance_type": {
-                "vcpu": 4,
-                "memory_mib": 4096,
+                "vcpu": 2,
+                "memory_mib": 4000,
                 "disk_mb": 10240
             },
             "rollout_step_percentage": 100
@@ -77,7 +77,7 @@
 		{
 			"binding": "DB",
 			"database_name": "vibesdk-db",
-			"database_id": "c4721a2b-b96a-428a-8b2a-b3d255b307e9",
+			"database_id": "1e65a293-2dde-4c8f-a49c-7943a8b1dc5c",
 			"migrations_dir": "migrations",
 			"remote": true
 		}
@@ -108,7 +108,7 @@
     "kv_namespaces": [
         {
             "binding": "VibecoderStore",
-            "id": "f066f3c2e4824981b48e8586c04db9c1",
+            "id": "e9f01ebeaf964205b8ade495df5de130",
             "remote": true
         }
     ],
@@ -129,24 +129,24 @@
 	],
 	"routes": [
         {
-            "pattern": "build.cloudflare.dev",
+            "pattern": "crowdin.app",
             "custom_domain": true
         },
         {
-            "pattern": "*build-preview.cloudflare.dev/*",
+            "pattern": "*crowdin.app/*",
             "custom_domain": false,
-            "zone_id": "db01fac4261b2604aacad8410443a3e2"
+            "zone_id": "87c0f5bfed020486aff82cd9a09b4fdb"
         }
     ],
 	"vars": {
-        "TEMPLATES_REPOSITORY": "https://github.com/cloudflare/vibesdk-templates",
+        "TEMPLATES_REPOSITORY": "https://github.com/andrii-bodnar/vibesdk-templates",
         "ALLOWED_EMAIL": "",
         "DISPATCH_NAMESPACE": "vibesdk-default-namespace",
         "ENABLE_READ_REPLICAS": "true",
         "CLOUDFLARE_AI_GATEWAY": "vibesdk-gateway",
-        "CUSTOM_DOMAIN": "",
+        "CUSTOM_DOMAIN": "crowdin.app",
         "MAX_SANDBOX_INSTANCES": "10",
-        "SANDBOX_INSTANCE_TYPE": "standard"
+        "SANDBOX_INSTANCE_TYPE": "basic"
     },
 	"workers_dev": false,
 	"preview_urls": false
