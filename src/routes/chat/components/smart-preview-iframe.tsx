@@ -426,7 +426,7 @@ export const SmartPreviewIframe = forwardRef<HTMLIFrameElement, SmartPreviewIfra
 									}));
 									handleManualRetry();
 								}}
-								className="flex items-center justify-center gap-2 px-6 py-3 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors text-sm mx-auto font-medium"
+								className="flex items-center justify-center gap-2 px-6 py-3 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors text-sm mx-auto font-medium"
 							>
 								<RotateCcw className="size-4" />
 								Nah, I would try turning things off and on again

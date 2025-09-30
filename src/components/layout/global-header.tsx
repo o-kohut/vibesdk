@@ -32,7 +32,7 @@ export function GlobalHeader() {
 							}}
 							className='flex items-center'
 						>
-							<SidebarTrigger className="h-8 w-8 text-text-primary rounded-md hover:bg-orange-50/40 transition-colors duration-200" />
+							<SidebarTrigger className="h-8 w-8 text-text-primary rounded-md hover:bg-emerald-50/40 dark:hover:bg-emerald-950/20 transition-colors duration-200" />
 							<CloudflareLogo
 								className="flex-shrink-0 mx-auto transition-all duration-300"
 								style={{
