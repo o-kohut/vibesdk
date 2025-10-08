@@ -354,14 +354,7 @@ export function createWebSocketMessageHandler(deps: HandleMessageDeps) {
             }
 
             case 'runtime_error_found': {
-                const errorMessage = `I detected a runtime error, will work on it: 
-Count: ${message.count}
-Message: ${message.errors.map((e: any) => e.message).join('\n').trim()}`;
-                const truncatedMessage = errorMessage.length > 100 ? 
-                    errorMessage.substring(0, 100) + '...' : errorMessage;
-                
-                setMessages((prev) => [...prev, createAIMessage('runtime_error', truncatedMessage)]);
-                logger.info('Runtime error found', message.errors);
+                logger.info('Runtime error found in sandbox', message.errors);
                 
                 onDebugMessage?.('error', 
                     `Runtime Error (${message.count} errors)`,
@@ -714,13 +707,12 @@ Message: ${message.errors.map((e: any) => e.message).join('\n').trim()}`;
             }
 
             case 'rate_limit_error': {
+                const errorData = message.error;
                 const rateLimitMessage = handleRateLimitError(
-                    message.error,
+                    errorData.details,
                     onDebugMessage
                 );
                 setMessages(prev => [...prev, rateLimitMessage]);
-
-                toast.error(`Error: ${message.error}`);
                 
                 break;
             }

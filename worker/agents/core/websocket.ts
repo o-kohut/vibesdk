@@ -3,6 +3,7 @@ import { createLogger } from '../../logger';
 import { WebSocketMessageRequests, WebSocketMessageResponses } from '../constants';
 import { SimpleCodeGeneratorAgent } from './simpleGeneratorAgent';
 import { WebSocketMessage, WebSocketMessageData, WebSocketMessageType } from '../../api/websocketTypes';
+import { MAX_IMAGES_PER_MESSAGE, MAX_IMAGE_SIZE_BYTES } from '../../types/image-attachment';
 
 const logger = createLogger('CodeGeneratorWebSocket');
 
@@ -98,7 +99,7 @@ export function handleWebSocketMessage(agent: SimpleCodeGeneratorAgent, connecti
                 // Deploy current state for preview
                 logger.info('Deploying for preview');
                 agent.deployToSandbox().then((deploymentResult) => {
-                    logger.info('Preview deployed successfully!, deploymentResult: ', deploymentResult);
+                    logger.info(`Preview deployed successfully!, deploymentResult:`, deploymentResult);
                 }).catch((error: unknown) => {
                     logger.error('Error during preview deployment:', error);
                 });
@@ -107,24 +108,16 @@ export function handleWebSocketMessage(agent: SimpleCodeGeneratorAgent, connecti
                 logger.info(`Client reported errors: ${parsedMessage.data}`);
                 agent.setState({ ...agent.state, clientReportedErrors: parsedMessage.data });
                 break;
-            case WebSocketMessageRequests.SCREENSHOT_CAPTURED:
-                logger.info('Screenshot captured from client', {
-                    url: parsedMessage.data.url,
-                    viewport: parsedMessage.data.viewport
+            case WebSocketMessageRequests.CAPTURE_SCREENSHOT:
+                agent.captureScreenshot(parsedMessage.data.url, parsedMessage.data.viewport).then((screenshotResult) => {
+                    if (!screenshotResult) {
+                        logger.error('Failed to capture screenshot');
+                        return;
+                    }
+                    logger.info('Screenshot captured successfully!', screenshotResult);
+                }).catch((error: unknown) => {
+                    logger.error('Error during screenshot capture:', error);
                 });
-                
-                // // Save screenshot to agent state
-                // agent.setState({ 
-                //     ...agent.state, 
-                //     latestScreenshot: parsedMessage.data
-                // });
-                
-                // Update database with screenshot
-                agent.saveScreenshotToDatabase(parsedMessage.data).catch(error => {
-                    logger.error('Error saving screenshot to database:', error);
-                });
-                
-                logger.info(`Screenshot saved to state and database update initiated.`);
                 break;
             case WebSocketMessageRequests.STOP_GENERATION:
                 // Clear shouldBeGenerating flag when user manually stops
@@ -175,7 +168,9 @@ export function handleWebSocketMessage(agent: SimpleCodeGeneratorAgent, connecti
             case WebSocketMessageRequests.USER_SUGGESTION:
                 // Handle user suggestion for conversational AI
                 logger.info('Received user suggestion', {
-                    messageLength: parsedMessage.message?.length || 0
+                    messageLength: parsedMessage.message?.length || 0,
+                    hasImages: !!parsedMessage.images && parsedMessage.images.length > 0,
+                    imageCount: parsedMessage.images?.length || 0
                 });
                 
                 if (!parsedMessage.message) {
@@ -183,7 +178,23 @@ export function handleWebSocketMessage(agent: SimpleCodeGeneratorAgent, connecti
                     return;
                 }
                 
-                agent.handleUserInput(parsedMessage.message).catch((error: unknown) => {
+                // Validate image count and size
+                if (parsedMessage.images && parsedMessage.images.length > 0) {
+                    if (parsedMessage.images.length > MAX_IMAGES_PER_MESSAGE) {
+                        sendError(connection, `Maximum ${MAX_IMAGES_PER_MESSAGE} images allowed per message. Received ${parsedMessage.images.length} images.`);
+                        return;
+                    }
+                    
+                    // Validate each image size
+                    for (const image of parsedMessage.images) {
+                        if (image.size > MAX_IMAGE_SIZE_BYTES) {
+                            sendError(connection, `Image "${image.filename}" exceeds maximum size of ${MAX_IMAGE_SIZE_BYTES / (1024 * 1024)}MB`);
+                            return;
+                        }
+                    }
+                }
+                
+                agent.handleUserInput(parsedMessage.message, parsedMessage.images).catch((error: unknown) => {
                     logger.error('Error handling user suggestion:', error);
                     sendError(connection, `Error processing user suggestion: ${error instanceof Error ? error.message : String(error)}`);
                 });

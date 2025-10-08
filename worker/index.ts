@@ -7,7 +7,6 @@ import { createApp } from './app';
 // import { sentryOptions } from './observability/sentry';
 import { DORateLimitStore as BaseDORateLimitStore } from './services/rate-limit/DORateLimitStore';
 import { getPreviewDomain } from './utils/urls';
-
 // Durable Object and Service exports
 export { UserAppSandboxService, DeployerService } from './services/sandbox/sandboxSdkClient';
 
@@ -18,6 +17,17 @@ export const DORateLimitStore = BaseDORateLimitStore;
 
 // Logger for the main application and handlers
 const logger = createLogger('App');
+
+function setOriginControl(env: Env, request: Request, currentHeaders: Headers): Headers {
+    const previewDomain = env.CUSTOM_DOMAIN
+    const origin = request.headers.get('Origin');
+
+    const allowedOrigin = `https://${previewDomain}`;
+    if (origin === allowedOrigin) {
+        currentHeaders.set('Access-Control-Allow-Origin', allowedOrigin);
+    }
+    return currentHeaders;
+}
 
 /**
  * Handles requests for user-deployed applications on subdomains.
@@ -39,7 +49,24 @@ async function handleUserAppRequest(request: Request, env: Env): Promise<Respons
 	const sandboxResponse = await proxyToSandbox(request, env);
 	if (sandboxResponse) {
 		logger.info(`Serving response from sandbox for: ${hostname}`);
-		return sandboxResponse;
+		
+		// Add headers to identify this as a sandbox response
+		let headers = new Headers(sandboxResponse.headers);
+		
+        if (sandboxResponse.status === 500) {
+            headers.set('X-Preview-Type', 'sandbox-error');
+        } else {
+            headers.set('X-Preview-Type', 'sandbox');
+        }
+        headers = setOriginControl(env, request, headers);
+        headers.append('Vary', 'Origin');
+		headers.set('Access-Control-Expose-Headers', 'X-Preview-Type');
+		
+		return new Response(sandboxResponse.body, {
+			status: sandboxResponse.status,
+			statusText: sandboxResponse.statusText,
+			headers,
+		});
 	}
 
 	// 2. If sandbox misses, attempt to dispatch to a deployed worker.
@@ -55,7 +82,21 @@ async function handleUserAppRequest(request: Request, env: Env): Promise<Respons
 
 	try {
 		const worker = dispatcher.get(appName);
-		return await worker.fetch(request);
+		const dispatcherResponse = await worker.fetch(request);
+		
+		// Add headers to identify this as a dispatcher response
+		let headers = new Headers(dispatcherResponse.headers);
+		
+		headers.set('X-Preview-Type', 'dispatcher');
+        headers = setOriginControl(env, request, headers);
+        headers.append('Vary', 'Origin');
+		headers.set('Access-Control-Expose-Headers', 'X-Preview-Type');
+		
+		return new Response(dispatcherResponse.body, {
+			status: dispatcherResponse.status,
+			statusText: dispatcherResponse.statusText,
+			headers,
+		});
 	} catch (error: any) {
 		// This block catches errors if the binding doesn't exist or if worker.fetch() fails.
 		logger.warn(`Error dispatching to worker '${appName}': ${error.message}`);
@@ -68,6 +109,7 @@ async function handleUserAppRequest(request: Request, env: Env): Promise<Respons
  */
 const worker = {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+        console.log(`Received request: ${request.method} ${request.url}`);
 		// --- Pre-flight Checks ---
 
 		// 1. Critical configuration check: Ensure custom domain is set.

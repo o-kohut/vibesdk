@@ -1,22 +1,25 @@
 import { PhaseConceptType, FileOutputType, PhaseConceptSchema } from '../schemas';
 import { IssueReport } from '../domain/values/IssueReport';
-import { createUserMessage } from '../inferutils/common';
+import { createUserMessage, createMultiModalUserMessage } from '../inferutils/common';
 import { executeInference } from '../inferutils/infer';
 import { issuesPromptFormatter, PROMPT_UTILS, STRATEGIES } from '../prompts';
-import { CodeGenerationStreamingState } from '../streaming-formats/base';
+import { CodeGenerationStreamingState } from '../output-formats/streaming-formats/base';
 import { FileProcessing } from '../domain/pure/FileProcessing';
 // import { RealtimeCodeFixer } from '../assistants/realtimeCodeFixer';
 import { AgentOperation, getSystemPromptWithProjectContext, OperationOptions } from '../operations/common';
-import { SCOFFormat, SCOFParsingState } from '../streaming-formats/scof';
+import { SCOFFormat, SCOFParsingState } from '../output-formats/streaming-formats/scof';
 import { TemplateRegistry } from '../inferutils/schemaFormatters';
 import { IsRealtimeCodeFixerEnabled, RealtimeCodeFixer } from '../assistants/realtimeCodeFixer';
 import { AGENT_CONFIG } from '../inferutils/config';
+import { CodeSerializerType } from '../utils/codeSerializers';
+import type { UserContext } from '../core/types';
 
 export interface PhaseImplementationInputs {
     phase: PhaseConceptType
     issues: IssueReport
     isFirstPhase: boolean
     shouldAutoFix: boolean
+    userContext?: UserContext;
     fileGeneratingCallback: (filePath: string, filePurpose: string) => void
     fileChunkGeneratedCallback: (filePath: string, chunk: string, format: 'full_content' | 'unified_diff') => void
     fileClosedCallback: (file: FileOutputType, message: string) => void
@@ -46,11 +49,12 @@ export const SYSTEM_PROMPT = `<ROLE>
        - **Interactive Polish**: Smooth animations, hover states, micro-interactions
        - **Responsive Perfection**: Flawless layouts across all device sizes
        - **User Experience**: Intuitive navigation, clear feedback, delightful interactions
+       - **Supreme software development practices**: Follow the best coding principles and practices, and lay out the codebase in a way that is easy to maintain, extend and debug.
     4. **VALIDATE** that implementation is deployable, error-free, AND visually stunning
     
     **Success Criteria:**
     - Application is demoable, deployable, AND visually impressive after this phase
-    - Zero runtime errors or deployment-blocking issues
+    - Zero runtime errors or deployment-blocking issues. All issues from previous phases are also fixed.
     - All phase requirements from architect are fully implemented
     - Code meets Cloudflare's highest standards for robustness, performance, AND visual excellence
     - Users are delighted by the interface design and smooth interactions
@@ -66,6 +70,52 @@ export const SYSTEM_PROMPT = `<ROLE>
     •   Due to security constraints, Only a fixed set of packages and dependencies are allowed for you to use which are preconfigured in the project and listed in <DEPENDENCIES>. Verify every import statement against them before using them.
     •   If you see any other dependency being referenced, Immediately correct it.
 </CONTEXT>
+
+${PROMPT_UTILS.UI_GUIDELINES}
+
+We follow the following strategy at our team for rapidly delivering projects:
+${STRATEGIES.FRONTEND_FIRST_CODING}
+
+${PROMPT_UTILS.REACT_RENDER_LOOP_PREVENTION}
+
+⚠️⚠️⚠️ ABSOLUTE ZERO-TOLERANCE RULES - VIOLATION CRASHES THE APP ⚠️⚠️⚠️
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║  🚨 ZUSTAND SELECTOR RULE - MOST COMMON BUG - READ THIS FIRST 🚨               ║
+║                                                                               ║
+║  ❌ FORBIDDEN - WILL CAUSE INFINITE LOOP:                                     ║
+║     const { a, b, c } = useStore(s => ({ a: s.a, b: s.b, c: s.c }))           ║
+║     const items = useStore(s => s.getItems())  // Returns new array           ║
+║     const { a, b, c } = useStore() // NO Selector provided!                   ║
+║                                                                               ║
+║  ✅ REQUIRED - TWO SAFE PATTERNS:                                             ║
+║     // Pattern 1: Separate selectors (foolproof, always safe)                ║
+║     const a = useStore(s => s.a);                                            ║
+║     const b = useStore(s => s.b);                                            ║
+║     const c = useStore(s => s.c);                                            ║
+║                                                                               ║
+║     // Pattern 2: useShallow wrapper (advanced, only if needed)              ║
+║     import { useShallow } from 'zustand/react/shallow';                      ║
+║     const { a, b, c } = useStore(useShallow(s => ({ a: s.a, b: s.b })));     ║
+║                                                                               ║
+║  ⚠️  CRITICAL: useStore(s => ({ ... })) WITHOUT useShallow = CRASH           ║
+║                                                                               ║
+║  WHY: Object-literal selectors create NEW objects every render causing        ║
+║       "Maximum update depth exceeded" errors that break the entire app.       ║
+║                                                                               ║
+║  IF YOU WRITE THE FORBIDDEN PATTERN, YOU MUST IMMEDIATELY REWRITE THE FILE    ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+⚠️⚠️⚠️ THIS RULE OVERRIDES ALL OTHER CONSIDERATIONS INCLUDING CODE AESTHETICS ⚠️⚠️⚠️
+
+**ZUSTAND PATTERN VALIDATION BEFORE SUBMITTING ANY FILE:**
+✅ Every useStore call must either:
+   1. Select a single primitive: useStore(s => s.value) OR
+   2. Use useShallow wrapper: useStore(useShallow(s => ({ ... })))
+
+❌ Search your code for "useStore(s => ({" pattern
+   - If found WITHOUT useShallow wrapper, REWRITE immediately
+   - When in doubt, use Pattern 1 (separate selectors)
 
 <CLIENT REQUEST>
 "{{query}}"
@@ -87,27 +137,44 @@ additional dependencies/frameworks **may** be provided:
 These are the only dependencies, components and plugins available for the project
 </DEPENDENCIES>
 
-${PROMPT_UTILS.UI_GUIDELINES}
-
-We follow the following strategy at our team for rapidly delivering projects:
-${STRATEGIES.FRONTEND_FIRST_CODING}
-
 {{template}}`;
 
-const USER_PROMPT = `**IMPLEMENT THE FOLLOWING PROJECT PHASE**
-<CURRENT_PHASE>
-{{phaseText}}
-</CURRENT_PHASE>
+// Hopefully most of the system prompt should get cached
+// I know things are very redundant here, but I am tired of having it write code with re-render loops
+// Sorry for all the extra tokens these might eat up. You may remove the redundant stuff in your versions though
+
+const USER_PROMPT = `**Phase Implementation**
 
 <INSTRUCTIONS & CODE QUALITY STANDARDS>
 These are the instructions and quality standards that must be followed to implement this phase.
 **CRITICAL ERROR PREVENTION (Fix These First):**
     
     1. **React Render Loop Prevention** - HIGHEST PRIORITY
-       - Never call setState during render phase
-       - Always use dependency arrays in useEffect
-       - Avoid unconditional setState in useEffect
-       - Stabilize object/array references with useMemo/useCallback
+        - Never call setState during render phase
+        - Always use dependency arrays in useEffect
+        - **Store actions are stable - exclude from dependencies**
+        - For Zustand: use \`useShallow\` not \`shallow\` as second param (v5)
+        - **Zustand Selector Rule (ZERO TOLERANCE - CAUSES APP CRASHES):**
+          ✅ SAFE Option 1: const a = useStore(s => s.a); const b = useStore(s => s.b);
+          ✅ SAFE Option 2: import { useShallow } from 'zustand/react/shallow';
+                           const { a, b } = useStore(useShallow(s => ({ a: s.a, b: s.b })));
+          ❌ FORBIDDEN: These ALL cause infinit loops:
+            Pattern 1: const { a, b } = useStore(s => ({ a: s.a, b: s.b }))  // Object literal.  NO useShallow = CRASH
+            Pattern 2: const { a, b } = useStore()  // NO SELECTOR = returns whole state
+            Pattern 3: const state = useStore(); const { a, b } = state;  // Destructure after
+        
+        For example, 
+        // This works fine in regular React:
+        const { user, isLoading } = useContext(UserContext);
+
+        // But this is not:
+        const { vfs, loading } = useVFSStore();  // ❌ WRONG!
+        // Zustand is subscription-based, not context-based!
+          
+        **Default to Option 1 when unsure. Option 2 requires useShallow import.**
+        **Destructuring from a returned object creates NEW references every render = loop**
+        - Avoid unconditional setState in useEffect
+        - Stabilize object/array references with useMemo/useCallback
     
     2. **Variable Declaration Order** - CRITICAL
        - Declare/import ALL variables before use
@@ -124,7 +191,79 @@ These are the instructions and quality standards that must be followed to implem
        - Validate array length before element access
        - Use try-catch for async operations
        - Handle undefined values gracefully
+
+    5. Layout Architecture Requirements (MANDATORY, copy these patterns)
+    - Full-height page layout:
+    <div className="h-screen flex flex-col">
+        <header className="flex-shrink-0">...</header>
+        <main className="flex-1 overflow-auto">...</main>
+    </div>
+
+    - Sidebar + main layout (Finder/IDE/Dashboard):
+    <div className="h-full flex">
+        <aside className="w-64 min-w-[180px] flex-shrink-0">...</aside>
+        <main className="flex-1 overflow-auto">...</main>
+    </div>
+    Notes:
+    - Always give the sidebar a min-width via CSS (min-w-[180px]) to prevent text cutoff.
+    - Prefer CSS min-w on content instead of relying on % minimums.
+
+    - Resizable panels (horizontal):
+    <ResizablePanelGroup direction="horizontal" className="h-full">
+        <ResizablePanel defaultSize={25}>
+        <aside className="h-full min-w-[180px]">...</aside>
+        </ResizablePanel>
+        <ResizableHandle withHandle />
+        <ResizablePanel defaultSize={75}>
+        <main className="h-full overflow-auto">...</main>
+        </ResizablePanel>
+    </ResizablePanelGroup>
+    Notes:
+    - Parent must have explicit height (h-full / h-screen).
+    - Put a ResizableHandle between panels.
+    - Use CSS min-w-[...] on the sidebar content to guarantee readable width.
+
+    - Data-driven rendering (always guard):
+    if (isLoading) return <LoadingSkeleton />;
+    if (error) return <ErrorState message={error} />;
+    if (!items?.length) return <EmptyState />;
+    return <List items={items} />;
+
+    6. Framer Motion Drag Handle Policy (correct API usage)
+    - Framer Motion does NOT support a dragHandle prop.
+    - If you need a specific header as the drag handle:
+    - Use useDragControls(), set dragListener={false} on the draggable motion.div
+    - In the header onPointerDown, call controls.start(e)
+    - Example:
+        const controls = useDragControls();
+        <motion.div drag dragControls={controls} dragListener={false}>...</motion.div>
+        <header onPointerDown={(e) => controls.start(e)}>...</header>
+
+    7. Type Safety: Prefer proper types over casting (avoid misuse of \`as\`)
+    - ✅ Correct: Fix object shape to match type
+      const node: VFSFolder = { id, type: 'folder', name, parentId, children: [] };
     
+    - ⚠️ Use sparingly: \`as\` for DOM elements or explicit type narrowing
+      const input = event.target as HTMLInputElement;
+    
+    - ❌ Wrong: Forcing incompatible types (missing required fields)
+      const node = { id, type: 'folder', name } as VFSFolder; // Missing children!
+
+    8. Null Safety & Async Error Handling (CRITICAL - prevents most runtime crashes)
+    - Always use optional chaining: user?.profile?.name not user.profile.name
+    - Always use nullish coalescing for defaults: items ?? [] not items || []
+    - ALWAYS wrap async operations in try-catch with error state:
+      try {
+        const data = await fetch('/api/data');
+        setData(data);
+        setError(null);
+      } catch (err) {
+        console.error('API failed:', err);
+        setError(err instanceof Error ? err.message : 'Unknown error');
+      }
+    - Add debug logging before potential crashes:
+      if (!data) { console.warn('Data missing'); return <Loading />; }
+
     **CODE QUALITY STANDARDS:**
     •   **Robustness:** Write fault-tolerant code with proper error handling and fallbacks
     •   **State Management:** Ensure UI reflects application state correctly, no infinite re-renders
@@ -190,8 +329,6 @@ Also understand the following:
 
 ${PROMPT_UTILS.COMMON_PITFALLS}
 
-</INSTRUCTIONS & CODE QUALITY STANDARDS>
-
 Every single file listed in <CURRENT_PHASE> needs to be implemented in this phase, based on the provided <OUTPUT FORMAT>.
 
 **CRITICAL IMPLEMENTATION RULES:**
@@ -204,9 +341,19 @@ Every single file listed in <CURRENT_PHASE> needs to be implemented in this phas
 
 ⚠️  **ZUSTAND SELECTOR POLICY** — ZERO TOLERANCE
 - Do NOT return objects/arrays from \`useStore\` selectors
-- Do NOT destructure from object-literal selectors (e.g., \`const { a, b } = useStore((s) => ({ a: s.a, b: s.b }))\`)
+- STRONGLY refer to all previous zustand guidelines
+- Do NOT call methods that return arrays/objects: \`useStore(s => s.getItems())\` ❌
+- NEVER use: \`state.getXxx()\`, \`state.computeXxx()\`, \`state.findXxx()\` in selectors
 - Always select primitives individually via separate \`useStore\` calls
-- If you absolutely must read multiple values in one call, pass zustand's shallow comparator: \`useStore(selector, shallow)\`. Avoid object literals.
+- If you see "getSnapshot should be cached" warning/error → Your selector returns unstable references
+\`\`\`tsx
+// ❌ BAD: Method returns new array every render
+const items = useStore(s => s.getFilteredItems());
+// ✅ GOOD: Select primitives, compute with useMemo
+const allItems = useStore(s => s.items);
+const filter = useStore(s => s.filter);
+const items = useMemo(() => allItems.filter(i => i.status === filter), [allItems, filter]);
+\`\`\`
 
 ⚠️  **BACKWARD COMPATIBILITY** - PRESERVE EXISTING FUNCTIONALITY  
 - Do NOT break anything from previous phases
@@ -216,9 +363,35 @@ Every single file listed in <CURRENT_PHASE> needs to be implemented in this phas
 
 ${PROMPT_UTILS.COMMON_DEP_DOCUMENTATION}
 
+</INSTRUCTIONS & CODE QUALITY STANDARDS>
+
+**IMPLEMENT THE FOLLOWING PROJECT PHASE**
+<CURRENT_PHASE>
+{{phaseText}}
+
 {{issues}}
 
-{{technicalInstructions}}`;
+{{userSuggestions}}
+
+</CURRENT_PHASE>`;
+
+// If things still don't work, add these ->
+// •   **MANDATORY: For every React file (.tsx/.jsx), add this verification checklist as a comment at the END of the file:**
+// \`\`\`tsx
+// /*
+//  * RENDER LOOP PREVENTION CHECKLIST:
+//  * noSetStateInRender?
+//  * allEffectsHaveDeps?
+//  * noStoreMethodSelectors?
+//  * stableDependencies?
+//  * primitiveSelectorsOnly?
+//  * noRecursiveState?
+//  * contextValuesMemoized?
+//  * noEffectMutatesState?
+//  * functionalUpdates?
+//  * stableCallbacks?
+//  */
+// \`\`\`
 
 const LAST_PHASE_PROMPT = `Finalization and Review phase. 
 Goal: Thoroughly review the entire codebase generated in previous phases. Identify and fix any remaining critical issues (runtime errors, logic flaws, rendering bugs) before deployment.
@@ -304,11 +477,29 @@ Do not provide any additional text or explanation.
 All your output will be directly saved in the README.md file. 
 Do not provide and markdown fence \`\`\` \`\`\` around the content either! Just pure raw markdown content!`;
 
+const formatUserSuggestions = (suggestions?: string[] | null): string => {
+    if (!suggestions || suggestions.length === 0) {
+        return '';
+    }
+    
+    return `
+<USER SUGGESTIONS>
+The following client suggestions and feedback have been provided, relayed by our client conversation agent.
+Please address these **on priority** in this phase.
+
+**Client Feedback & Suggestions**:
+${suggestions.map((suggestion, index) => `${index + 1}. ${suggestion}`).join('\n')}
+
+**IMPORTANT**: Resolve these in the right and most elegant, non-hacky way. If resolving user-reported critical issues/bugs, please refer to the guidelines already provided.
+Try to make small targeted, isolated changes to the codebase to address the user's suggestions unless a complete rework is required.
+</USER SUGGESTIONS>`;
+};
+
 const specialPhasePromptOverrides: Record<string, string> = {
     "Finalization and Review": LAST_PHASE_PROMPT,
 }
 
-const userPropmtFormatter = (phaseConcept: PhaseConceptType, issues: IssueReport) => {
+const userPromptFormatter = (phaseConcept: PhaseConceptType, issues: IssueReport, userSuggestions?: string[]) => {
     const phaseText = TemplateRegistry.markdown.serialize(
         phaseConcept,
         PhaseConceptSchema
@@ -316,7 +507,8 @@ const userPropmtFormatter = (phaseConcept: PhaseConceptType, issues: IssueReport
     
     const prompt = PROMPT_UTILS.replaceTemplateVariables(specialPhasePromptOverrides[phaseConcept.name] || USER_PROMPT, {
         phaseText,
-        issues: issuesPromptFormatter(issues)
+        issues: issuesPromptFormatter(issues),
+        userSuggestions: formatUserSuggestions(userSuggestions)
     });
     return PROMPT_UTILS.verifyPrompt(prompt);
 }
@@ -326,7 +518,7 @@ export class PhaseImplementationOperation extends AgentOperation<PhaseImplementa
         inputs: PhaseImplementationInputs,
         options: OperationOptions
     ): Promise<PhaseImplementationOutputs> {
-        const { phase, issues } = inputs;
+        const { phase, issues, userContext } = inputs;
         const { env, logger, context } = options;
         
         logger.info(`Generating files for phase: ${phase.name}`, phase.description, "files:", phase.files.map(f => f.path));
@@ -334,8 +526,19 @@ export class PhaseImplementationOperation extends AgentOperation<PhaseImplementa
         // Notify phase start
         const codeGenerationFormat = new SCOFFormat();
         // Build messages for generation
-        const messages = getSystemPromptWithProjectContext(SYSTEM_PROMPT, context, true);
-        messages.push(createUserMessage(userPropmtFormatter(phase, issues) + codeGenerationFormat.formatInstructions()));
+        const messages = getSystemPromptWithProjectContext(SYSTEM_PROMPT, context, CodeSerializerType.SCOF);
+        
+        // Create user message with optional images
+        const userPrompt = userPromptFormatter(phase, issues, userContext?.suggestions) + codeGenerationFormat.formatInstructions();
+        const userMessage = userContext?.images && userContext.images.length > 0
+            ? createMultiModalUserMessage(
+                userPrompt,
+                userContext.images.map(img => `data:${img.mimeType};base64,${img.base64Data}`),
+                'high'
+            )
+            : createUserMessage(userPrompt);
+        
+        messages.push(userMessage);
     
         // Initialize streaming state
         const streamingState: CodeGenerationStreamingState = {
@@ -433,7 +636,6 @@ export class PhaseImplementationOperation extends AgentOperation<PhaseImplementa
     
         // Return generated files for validation and deployment
         return {
-            // rawFiles: generatedFilesInPhase,
             fixedFilePromises,
             deploymentNeeded: fixedFilePromises.length > 0,
             commands,
@@ -446,7 +648,7 @@ export class PhaseImplementationOperation extends AgentOperation<PhaseImplementa
 
         try {
             let readmePrompt = README_GENERATION_PROMPT;
-            const messages = [...getSystemPromptWithProjectContext(SYSTEM_PROMPT, context, true), createUserMessage(readmePrompt)];
+            const messages = [...getSystemPromptWithProjectContext(SYSTEM_PROMPT, context, CodeSerializerType.SCOF), createUserMessage(readmePrompt)];
 
             const results = await executeInference({
                 env: env,

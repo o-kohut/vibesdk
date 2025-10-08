@@ -1,10 +1,10 @@
-import { RuntimeError, RuntimeErrorSchema, StaticAnalysisResponse, TemplateDetails, TemplateFileSchema } from "../services/sandbox/sandboxTypes";
+import { FileTreeNode, RuntimeError, StaticAnalysisResponse, TemplateDetails } from "../services/sandbox/sandboxTypes";
 import { TemplateRegistry } from "./inferutils/schemaFormatters";
 import z from 'zod';
 import { Blueprint, BlueprintSchema, ClientReportedErrorSchema, ClientReportedErrorType, FileOutputType, PhaseConceptSchema, PhaseConceptType, TemplateSelection } from "./schemas";
 import { IssueReport } from "./domain/values/IssueReport";
-import { SCOFFormat } from "./streaming-formats/scof";
-import { MAX_PHASES } from "./core/state";
+import { FileState, MAX_PHASES } from "./core/state";
+import { CODE_SERIALIZERS, CodeSerializerType } from "./utils/codeSerializers";
 
 export const PROMPT_UTILS = {
     /**
@@ -23,13 +23,38 @@ export const PROMPT_UTILS = {
         return result;
     },
 
-    serializeTemplate(template?: TemplateDetails, forCodegen: boolean = true): string {
+    serializeTreeNodes(node: FileTreeNode): string {
+        // The output starts with the root node's name.
+        const outputParts: string[] = [node.path.split('/').pop() || node.path];
+    
+        function processChildren(children: FileTreeNode[], prefix: string) {
+            children.forEach((child, index) => {
+                const isLast = index === children.length - 1;
+                const connector = isLast ? '└── ' : '├── ';
+                const displayName = child.path.split('/').pop() || child.path;
+    
+                outputParts.push(prefix + connector + displayName);
+    
+                // If the child is a directory with its own children, recurse deeper.
+                if (child.type === 'directory' && child.children && child.children.length > 0) {
+                    // The prefix for the next level depends on whether the current node
+                    // is the last in its list. This determines if we use a vertical line or a space.
+                    const childPrefix = prefix + (isLast ? '    ' : '│   ');
+                    processChildren(child.children, childPrefix);
+                }
+            });
+        }
+    
+        // Start the process if the root node has children.
+        if (node.children && node.children.length > 0) {
+            processChildren(node.children, '');
+        }
+    
+        return outputParts.join('\n');
+    },
+
+    serializeTemplate(template?: TemplateDetails): string {
         if (template) {
-            // const filesText = JSON.stringify(tpl.files, null, 2);
-            const filesText = TemplateRegistry.markdown.serialize(
-                { files: template.files.filter(f => !f.filePath.includes('package.json')) },
-                z.object({ files: z.array(TemplateFileSchema) })
-            );
             // const indentedFilesText = filesText.replace(/^(?=.)/gm, '\t\t\t\t'); // Indent each line with 4 spaces
             return `
 <TEMPLATE DETAILS>
@@ -37,17 +62,6 @@ The following are the details (structures and files) of the starting boilerplate
 
 Name: ${template.name}
 Frameworks: ${template.frameworks?.join(', ')}
-
-${forCodegen ? `` : `
-<TEMPLATE_CORE_FILES>
-**SHADCN COMPONENTS, Error boundary components and use-toast hook ARE PRESENT AND INSTALLED BUT EXCLUDED FROM THESE FILES DUE TO CONTEXT SPAM**
-${filesText}
-</TEMPLATE_CORE_FILES>`}
-
-<TEMPLATE_FILE_TREE>
-**Use these files as a reference for the file structure, components and hooks that are present**
-${JSON.stringify(template.fileTree, null, 2)}
-</TEMPLATE_FILE_TREE>
 
 Apart from these files, All SHADCN Components are present in ./src/components/ui/* and can be imported from there, example: import { Button } from "@/components/ui/button";
 **Please do not rewrite these components, just import them and use them**
@@ -57,12 +71,12 @@ ${template.description.usage}
 
 <DO NOT TOUCH FILES>
 These files are forbidden to be modified. Do not touch them under any circumstances.
-${template.dontTouchFiles.join('\n')}
+${(template.dontTouchFiles ?? []).join('\n')}
 </DO NOT TOUCH FILES>
 
 <REDACTED FILES>
 These files are redacted. They exist but their contents are hidden for security reasons. Do not touch them under any circumstances.
-${template.redactedFiles.join('\n')}
+${(template.redactedFiles ?? []).join('\n')}
 </REDACTED FILES>
 
 **Websockets and dynamic imports are not supported, so please avoid using them.**
@@ -93,9 +107,13 @@ and provide a preview url for the application.
         if (errors && errors.length > 0) {
             const errorsSerialized = errors.map(e => {
                 // Use rawOutput if available, otherwise serialize using schema
-                const errorText = e.rawOutput || TemplateRegistry.markdown.serialize(e, RuntimeErrorSchema);
+                const errorText = e.message;
+                // Remove any trace lines with no 'tsx' or 'ts' extension in them
+                const cleanedText = errorText.split('\n')
+                                    .map(line => line.includes('/deps/') && !(line.includes('.tsx') || line.includes('.ts')) ? '...' : line)
+                                    .join('\n');
                 // Truncate to 1000 characters to prevent context overflow
-                return errorText.slice(0, 1000);
+                return `<error>${cleanedText.slice(0, 1000)}</error>`;
             });
             return errorsSerialized.join('\n\n');
         } else {
@@ -134,18 +152,9 @@ ${typecheckOutput}`;
         return prompt;
     },
 
-    serializeFiles(files: FileOutputType[]): string {
-        // TemplateRegistry.markdown.serialize({ files: files }, z.object({ files: z.array(FileOutputSchema) }))
-        // return files.map(file => {
-        //     return `File: ${file.filePath}\nPurpose: ${file.filePurpose}\nContents: ${file.fileContents}`;
-        // }).join('\n');
+    serializeFiles(files: FileOutputType[], serializerType: CodeSerializerType): string {
         // Use scof format
-        return new SCOFFormat().serialize(files.map(file => {
-            return {
-                ...file,
-                format: 'full_content'
-            }
-        }));
+        return CODE_SERIALIZERS[serializerType](files);
     },
 
     REACT_RENDER_LOOP_PREVENTION: `<REACT_RENDER_LOOP_PREVENTION>
@@ -331,6 +340,39 @@ const selectedChannelId = useAppStore((state) => state.selectedChannelId);
 const selectChannel = useAppStore((state) => state.selectChannel);
 \`\`\`
 
+**Store Methods Returning Arrays/Objects (CRITICAL - VERY COMMON BUG):**
+\`\`\`tsx
+// BAD CODE ❌ Method returns new array every render → infinite loop
+const useStore = create((set, get) => ({
+    vfs: {},
+    currentId: '1',
+    getChildren: () => {
+        const { vfs, currentId } = get();
+        const dir = vfs[currentId];
+        return dir?.children.map(id => vfs[id]) || []; // NEW ARRAY EVERY CALL
+    }
+}));
+function Component() {
+    const children = useStore(state => state.getChildren()); // ❌ INFINITE LOOP
+    return <div>{children.map(...)}</div>;
+}
+
+// GOOD CODE ✅ Select primitives, compute in component with useMemo
+const useStore = create((set) => ({
+    vfs: {},
+    currentId: '1',
+}));
+function Component() {
+    const vfs = useStore(state => state.vfs);
+    const currentId = useStore(state => state.currentId);
+    const children = useMemo(() => {
+        const dir = vfs[currentId];
+        return dir?.children.map(id => vfs[id]) || [];
+    }, [vfs, currentId]); // ✅ STABLE with useMemo
+    return <div>{children.map(...)}</div>;
+}
+\`\`\`
+
 ## Other Common Loop-Inducing Patterns
 
 **Parent/Child Feedback Loops:**
@@ -399,8 +441,10 @@ function Counter() {
 ✅ **Provide dependency arrays to every useEffect** - Missing dependencies cause infinite loops  
 ✅ **Make effect logic conditional** - Add guards like \`if (data.length > 0)\` to prevent re-triggering  
 ✅ **Stabilize non-primitive dependencies** - Use useMemo and useCallback for objects/arrays/functions  
-✅ **Select primitives from stores** - \`useStore(s => s.score)\` not \`useStore(s => ({ score: s.score }))\`  
+✅ **Select primitives from stores** - \`useStore(s => s.score)\` not \`useStore(s => ({ score: s.score }))\`
+✅ **NEVER call store methods in selectors** - \`useStore(s => s.getItems())\` ❌ causes infinite loops
 ✅ **Lift state up from recursive components** - Never initialize state inside recursive calls  
+✅ **Store actions are stable** - In Zustand/Redux, action functions are stable references and should NOT be in dependency arrays of useEffect/useCallback/useMemo
 ✅ **Use functional updates** - \`setState(prev => prev + 1)\` avoids stale closures  
 ✅ **Prefer refs for non-UI data** - \`useRef\` doesn't trigger re-renders when updated  
 ✅ **Avoid prop→state mirrors** - Derive values directly or use proper synchronization  
@@ -448,7 +492,7 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
     3. **NO RUNTIME ERRORS:** Write robust, fault-tolerant code. Handle all edge cases gracefully with fallbacks. Never throw uncaught errors that can crash the application.
     4. **NO UNDEFINED VALUES/PROPERTIES/FUNCTIONS/COMPONENTS etc:** Ensure all variables, functions, and components are defined before use. Never use undefined values. If you use something that isn't already defined, you need to define it.
     5. **STATE UPDATE INTEGRITY:** Never call state setters directly during the render phase; all state updates must originate from event handlers or useEffect hooks to prevent infinite loops.
-    6. **STATE SELECTOR STABILITY:** When using state management libraries (Zustand, Redux), always select primitive values individually. Never return a new object or array from a single selector, as this creates unstable references and will cause infinite render loops.
+    6. **STATE SELECTOR STABILITY:** When using state management libraries (Zustand, Redux), always select primitive values individually. Never return a new object or array from a single selector, as this creates unstable references and will cause infinite render loops. NEVER call store methods like \`state.getXxx()\` inside selectors—they return new references every render.
     
     **UI/UX EXCELLENCE CRITICAL RULES:**
     7. **VISUAL HIERARCHY CLARITY:** Every interface must have clear visual hierarchy - never create pages with uniform text sizes or equal visual weight for all elements
@@ -457,6 +501,44 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
     10. **SPACING CONSISTENCY:** Use systematic spacing (space-y-4, space-y-6, space-y-8) - avoid arbitrary margins that create visual chaos
     11. **LOADING STATE EXCELLENCE:** Every async operation must have beautiful loading states - never leave users staring at blank screens
     12. **ERROR HANDLING GRACE:** All error states must be user-friendly with clear next steps - never show raw error messages or technical jargon
+    13. Height Chain Breaks
+    - h-full requires all parents to have explicit height.
+    - Root chains should be: html (100vh) -> body (h-full) -> #root/app (h-full) -> page container (h-screen or h-full).
+    - Symptom: content not visible or zero-height scrolling areas.
+
+    14. Flexbox Without Flex Parent
+    - flex-1 only works when parent is display:flex. Ensure parent has className="flex".
+    - For column layouts use flex-col; for row layouts use flex.
+
+    15. Resizable Sidebars + Text Cutoff
+    - Do not rely on %-based minimums for readable sidebar text.
+    - Always apply CSS min-w-[180px] (or appropriate) to the sidebar content, and use w-64 for initial width.
+    - Keep a ResizableHandle between panels and a parent with explicit height.
+
+    16. Framer Motion Drag Handle (Correct API)
+    - There is no dragHandle prop. Use useDragControls + dragListener={false} and trigger controls.start(e) in the header pointer down.
+    - Avoid adding non-existent props that cause TS2322.
+
+    17. Type-safe Object Construction (avoid misuse of \`as\`)
+    - When creating discriminated unions, include all fields required by that variant
+    - ✅ Correct: Fix object shape: const node: Folder = { id, type: 'folder', name, children: [] };
+    - ⚠️ Use sparingly: \`as\` for DOM or explicit narrowing: event.target as HTMLInputElement
+    - ❌ Wrong: Forcing types: const node = { id, name } as Folder; // Missing required fields!
+
+    18. Missing Try-Catch in Async Operations (causes silent failures)
+    - AI often forgets error handling in async functions
+    - ALWAYS wrap fetch/API calls in try-catch
+    - Set error state, don't silently fail
+    - Pattern: try { await api() } catch (e) { setError(e.message) }
+
+    19. Missing Optional Chaining (causes "cannot read property" crashes)
+    - Use ?. for all object access: user?.profile?.name
+    - Use ?? for defaults: items ?? []
+    - Prevents most common runtime crashes from null/undefined
+
+    20. No Debug Logging (makes AI bugs impossible to diagnose)
+        - Although you would not have access to browser logs, but console.error and console.warn in templates are wired to send error reports to our backend. 
+        - Thus, you consider adding extensive console.error and console.warn in code paths where you expect errors to occur, so its easier to debug.
 
     **ENHANCED RELIABILITY PATTERNS:**
     •   **State Management:** Handle loading/success/error states for async operations. Initialize state with proper defaults, never undefined. Use functional updates for dependent state.
@@ -474,6 +556,12 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
     •   **Keep actions responsible for side-effects (fetch/poll), and selectors responsible for derivation only.**
     •   **STRICT Zustand Selector Policy (ZERO TOLERANCE):** Do NOT return objects/arrays from \`useStore\` selectors nor destructure multiple values from an object-literal selector. Always select primitives individually. If you need multiple values, call \`useStore\` multiple times.
     •   If you absolutely must read multiple values in one call, pass zustand's shallow comparator: \`useStore(selector, shallow)\`. Avoid object literals and avoid \`useStore(s => s)\`.
+    
+    **ZUSTAND INFINITE LOOP ERROR SIGNATURES - IMMEDIATE FIX REQUIRED:**
+    If you encounter: "The result of getSnapshot should be cached" or "Maximum update depth exceeded" with Zustand:
+    → Your selector returns unstable references (new object/array each time)
+    → SCAN FOR: \`(state) => ({ ... })\`, \`state.getXxx()\`, \`state.items.filter(...)\`, \`state.items.map(...)\`
+    → FIX: Select ONLY primitives (\`state.count\`, \`state.name\`), compute derived values with \`useMemo\` in component
 
     **ALGORITHMIC PRECISION & LOGICAL REASONING:**
     •   **Mathematical Accuracy:** For games/calculations, implement precise algorithms step-by-step. ALWAYS validate boundaries: if (x >= 0 && x < width && y >= 0 && y < height). Use === for exact comparisons.
@@ -512,7 +600,11 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
     - All imports use correct syntax and paths. Be cautious about named vs default imports wherever needed.
     - All variables are defined before use  
     - No setState calls during render phase
-    - No object-literal selectors in Zustand (avoid \`useStore((state) => ({ ... }))\`; select primitives individually)
+    - No object-literal selectors in Zustand: \`useStore((state) => ({ ... }))\` ❌
+    - No method calls in Zustand selectors: \`useStore(s => s.getXxx())\` ❌
+    - No array/object operations in selectors: \`s.items.filter(...)\` ❌
+    - Only primitive selectors: \`useStore(s => s.count)\`, \`useStore(s => s.name)\` ✅
+    - Computed values use useMemo with primitive dependencies ✅
     - All Tailwind classes exist in config
     - External dependencies are available
     - Error boundaries around components that might fail
@@ -521,6 +613,7 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
 
     ### **IMPORT VALIDATION EXAMPLES**
     **CRITICAL**: Verify ALL imports before using. Wrong imports = runtime crashes.
+    **When suggesting to import packages, make sure to check if the package actually exists and is correct. If installing it fails multiple times, it is not a valid package.**
 
     **BAD IMPORTS** (cause runtime errors):
     \`\`\`tsx
@@ -555,14 +648,6 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
     # Never write image files! Never write jpeg, png, svg, etc files yourself! Always use some image url from the web.
 
 </AVOID COMMON PITFALLS>`,
-    STYLE_GUIDE: `<STYLE_GUIDE>
-    • Use 2 spaces for indentation
-    • Use single quotes for strings
-    • Use double quotes for JSX attributes
-    • Use semicolons for statements
-    • **Always use named exports and imports**
-</STYLE_GUIDE>
-`,
     COMMON_DEP_DOCUMENTATION: `<COMMON DEPENDENCY DOCUMENTATION>
     • **The @xyflow/react package doesn't export a default ReactFlow, it exports named imports.**
         - Don't import like this:
@@ -576,6 +661,18 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
         - With react 18, it will throw runtime error: Cannot read properties of undefined (reading 'S')
 
     • **No support for websockets and dynamic imports may not work, so please avoid using them.**
+    - **Zustand v5 (Always Installed in Templates):**
+      - **Try not to use shallow comparison (\`useShallow\`)** - it's a code smell indicating improper selector usage
+      - Instead of: \`useStore(useShallow(s => ({ a: s.a, b: s.b })))\` ❌
+      - Always use: \`const a = useStore(s => s.a); const b = useStore(s => s.b);\` ✅
+      - Why: Primitives are compared by value automatically, no shallow needed. Shallow adds complexity and is easy to forget.
+    - If you do need to use it, Don't use the v4 syntax: \`useStore(selector, shallow)\`
+    - Use the v5 syntax with the hook: 
+      \`\`\`tsx
+      import { useShallow } from 'zustand/shallow';
+      const state = useStore(useShallow(selector));
+      \`\`\`
+      - Store actions (like setState, updateData) are stable and should NOT be in dependency arrays
 </COMMON DEPENDENCY DOCUMENTATION>
 `,
     COMMANDS: `<SETUP COMMANDS>
@@ -585,6 +682,7 @@ COMMON_PITFALLS: `<AVOID COMMON PITFALLS>
         - Always suggest a known recent compatible stable major version. If unsure which version might be available, don't specify any version.
         - Example: \`npm install react@18 react-dom@18\`
         - List commands to add dependencies separately, one command per dependency for clarity.
+        - Make sure the packages actually exist and are correct.
     • **Format:** Provide ONLY the raw command(s) without comments, explanations, or step numbers, in the form of a list
     • **Execution:** These run *before* code generation begins.
 
@@ -752,31 +850,45 @@ bun add @geist-ui/react@1
     - ✅ **Empty State Beauty:** Inspiring empty states that guide users toward their first success
     - ✅ **Accessibility Excellence:** Proper contrast ratios, keyboard navigation, screen reader support
     - ✅ **Performance Smooth:** 60fps animations and instant perceived load times`,
-    PROJECT_CONTEXT: `Here is everything you will need for the project:
+    PROJECT_CONTEXT: `Here is everything you will need about the project:
 
-<PROJECT CONTEXT>
+<PROJECT_CONTEXT>
 
-<COMPLETED PHASES>
+<COMPLETED_PHASES>
 
 The following phases have been completed and implemented:
 
 {{phases}}
 
-</COMPLETED PHASES>
+</COMPLETED_PHASES>
+
+<LAST_DIFFS>
+These are the changes that have been made to the codebase since the last phase:
+
+{{lastDiffs}}
+
+</LAST_DIFFS>
 
 <CODEBASE>
 
-Here are all the relevant files in the current codebase:
+Here are all the latest relevant files in the current codebase:
 
 {{files}}
 
 **THESE DO NOT INCLUDE PREINSTALLED SHADCN COMPONENTS, REDACTED FOR SIMPLICITY. BUT THEY DO EXIST AND YOU CAN USE THEM.**
 
+<FILE_TREE>
+**Use these files as a reference for the file structure, components and hooks that are present**
+
+{{fileTree}}
+
+</FILE_TREE>
+
 </CODEBASE>
 
 {{commandsHistory}}
 
-</PROJECT CONTEXT>
+</PROJECT_CONTEXT>
 `,
 }
 
@@ -876,6 +988,13 @@ export const STRATEGIES_UTILS = {
             * Building any themed 2048 game: Has a single page, simple logic -> **Simple Project** - 1 phase and 2 files max. Initial phase should yield a perfectly working game.
             * Building a full chess platform: Has multiple pages -> **Complex Project** - 3-5 phases and 5-15 files, with initial phase having around 5-11 files and should have the primary homepage working with mockups for all other views.
             * Building a full e-commerce platform: Has multiple pages -> **Complex Project** - 3-5 phases and 5-15 files max, with initial phase having around 5-11 files and should have the primary homepage working with mockups for all other views.
+    
+
+        <TRUST & SAFETY POLICIES>
+        • **NEVER** provide any code that can be used to perform nefarious/malicious activities.
+        • **If a user asks to build a clone or look-alike of a popular product or service, alter the name and description, and explicitly add a visible disclaimer that it is a clone or look-alike to avoid phishing concerns.**
+        • **NEVER** Let users build applications for phishing or malicious purposes.
+        </TRUST & SAFETY POLICIES>
     </PHASE GENERATION CONSTRAINTS>`,
 }
 
@@ -923,7 +1042,6 @@ export interface GeneralSystemPromptBuilderParams {
     query: string,
     templateDetails: TemplateDetails,
     dependencies: Record<string, string>,
-    forCodegen: boolean,
     blueprint?: Blueprint,
     language?: string,
     frameworks?: string[],
@@ -937,14 +1055,14 @@ export function generalSystemPromptBuilder(
     // Base variables always present
     const variables: Record<string, string> = {
         query: params.query,
-        template: PROMPT_UTILS.serializeTemplate(params.templateDetails, params.forCodegen),
-        dependencies: JSON.stringify(params.dependencies || [])
+        template: PROMPT_UTILS.serializeTemplate(params.templateDetails),
+        dependencies: JSON.stringify(params.dependencies ?? {})
     };
 
     // Optional blueprint variables
     if (params.blueprint) {
         variables.blueprint = TemplateRegistry.markdown.serialize(params.blueprint, BlueprintSchema);
-        variables.blueprintDependencies = params.blueprint.frameworks.join(', ');
+        variables.blueprintDependencies = params.blueprint.frameworks?.join(', ') ?? '';
     }
 
     // Optional language and frameworks
@@ -963,7 +1081,7 @@ export function generalSystemPromptBuilder(
 }
 
 export function issuesPromptFormatter(issues: IssueReport): string {
-    const runtimeErrorsText = issues.runtimeErrors.map((error) => `<error>${error.rawOutput}</error>`).join('\n');
+    const runtimeErrorsText = PROMPT_UTILS.serializeErrors(issues.runtimeErrors);
     const staticAnalysisText = PROMPT_UTILS.serializeStaticAnalysis(issues.staticAnalysis);
     
     return `## ERROR ANALYSIS PRIORITY MATRIX
@@ -989,10 +1107,35 @@ ${staticAnalysisText}
 
 
 export const USER_PROMPT_FORMATTER = {
-    PROJECT_CONTEXT: (phases: PhaseConceptType[], files: FileOutputType[], commandsHistory: string[]) => {
+    PROJECT_CONTEXT: (phases: PhaseConceptType[], files: FileState[], fileTree: FileTreeNode, commandsHistory: string[], serializerType: CodeSerializerType = CodeSerializerType.SIMPLE) => {
+        let lastPhaseFilesDiff = '';
+        try {
+            if (phases.length > 1) {
+                const lastPhase = phases[phases.length - 1];
+                if (lastPhase && lastPhase.files) {
+                    // Get last phase files diff only
+                    const fileMap = new Map<string, FileState>();
+                    files.forEach((file) => fileMap.set(file.filePath, file));
+                    const lastPhaseFiles = lastPhase.files.map((file) => fileMap.get(file.path)).filter((file) => file !== undefined);
+                    lastPhaseFilesDiff = lastPhaseFiles.map((file) => file.lastDiff).join('\n');
+        
+                    // Set lastPhase = false for all phases but the last
+                    phases.forEach((phase) => {
+                        if (phase !== lastPhase) {
+                            phase.lastPhase = false;
+                        }
+                    });
+                }
+            }
+        } catch (error) {
+            console.error('Error processing project context:', error);
+        }
+
         const variables: Record<string, string> = {
             phases: TemplateRegistry.markdown.serialize({ phases: phases }, z.object({ phases: z.array(PhaseConceptSchema) })),
-            files: PROMPT_UTILS.serializeFiles(files),
+            files: PROMPT_UTILS.serializeFiles(files, serializerType),
+            fileTree: PROMPT_UTILS.serializeTreeNodes(fileTree),
+            lastDiffs: lastPhaseFilesDiff,
             commandsHistory: commandsHistory.length > 0 ? `<COMMANDS HISTORY>
 
 The following commands have been executed successfully in the project environment so far (These may not include the ones that are currently pending):

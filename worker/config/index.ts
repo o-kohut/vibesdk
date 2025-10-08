@@ -77,8 +77,15 @@ function deepMerge<T>(
     
     return result as T;
 }
+
+export interface GlobalMessagingSettings {
+    globalUserMessage: string;
+    changeLogs: string;
+}
+
 export interface GlobalConfigurableSettings {
     security: ConfigurableSecuritySettings;
+    globalMessaging: GlobalMessagingSettings;
 }
 
 type StoredConfig = DeepPartial<GlobalConfigurableSettings>;
@@ -91,7 +98,11 @@ export async function getGlobalConfigurableSettings(env: Env): Promise<GlobalCon
     }
     // Get default configuration
     const defaultConfig: GlobalConfigurableSettings = {
-        security: getConfigurableSecurityDefaults()
+        security: getConfigurableSecurityDefaults(),
+        globalMessaging: {
+            globalUserMessage: "",
+            changeLogs: ""
+        }
     };
     
     try {
@@ -120,7 +131,8 @@ export async function getGlobalConfigurableSettings(env: Env): Promise<GlobalCon
     }
 }
 
-export async function getUserConfigurableSettings(env: Env, userId: string, globalConfig: GlobalConfigurableSettings): Promise<GlobalConfigurableSettings> {
+export async function getUserConfigurableSettings(env: Env, userId: string): Promise<GlobalConfigurableSettings> {
+    const globalConfig = await getGlobalConfigurableSettings(env);
     if (!userId) {
         return globalConfig;
     }

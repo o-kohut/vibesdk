@@ -1,10 +1,13 @@
-import { TemplateDetails } from '../../services/sandbox/sandboxTypes'; // Import the type
+import { TemplateDetails, TemplateFileSchema } from '../../services/sandbox/sandboxTypes'; // Import the type
 import { STRATEGIES, PROMPT_UTILS, generalSystemPromptBuilder } from '../prompts';
 import { executeInference } from '../inferutils/infer';
 import { Blueprint, BlueprintSchema, TemplateSelection } from '../schemas';
 import { createLogger } from '../../logger';
-import { createSystemMessage, createUserMessage } from '../inferutils/common';
+import { createSystemMessage, createUserMessage, createMultiModalUserMessage } from '../inferutils/common';
 import { InferenceContext } from '../inferutils/config.types';
+import { TemplateRegistry } from '../inferutils/schemaFormatters';
+import type { ImageAttachment } from '../../types/image-attachment';
+import z from 'zod';
 
 const logger = createLogger('Blueprint');
 
@@ -127,6 +130,16 @@ ${STRATEGIES.FRONTEND_FIRST_PLANNING}
 <STARTING TEMPLATE>
 {{template}}
 
+<TEMPLATE_CORE_FILES>
+**SHADCN COMPONENTS, Error boundary components and use-toast hook ARE PRESENT AND INSTALLED BUT EXCLUDED FROM THESE FILES DUE TO CONTEXT SPAM**
+{{filesText}}
+</TEMPLATE_CORE_FILES>
+
+<TEMPLATE_FILE_TREE>
+**Use these files as a reference for the file structure, components and hooks that are present**
+{{fileTreeText}}
+</TEMPLATE_FILE_TREE>
+
 Preinstalled dependencies:
 {{dependencies}}
 </STARTING TEMPLATE>`;
@@ -222,6 +235,7 @@ Preinstalled dependencies:
 // - User request and use case specific instructions must be carefully understood and explicitly integrated.
 // `;
 
+
 export interface BlueprintGenerationArgs {
     env: Env;
     inferenceContext: InferenceContext;
@@ -231,6 +245,7 @@ export interface BlueprintGenerationArgs {
     // Add optional template info
     templateDetails: TemplateDetails;
     templateMetaInfo: TemplateSelection;
+    images?: ImageAttachment[];
     stream?: {
         chunk_size: number;
         onChunk: (chunk: string) => void;
@@ -241,29 +256,43 @@ export interface BlueprintGenerationArgs {
  * Generate a blueprint for the application based on user prompt
  */
 // Update function signature and system prompt
-export async function generateBlueprint({ env, inferenceContext, query, language, frameworks, templateDetails, templateMetaInfo, stream }: BlueprintGenerationArgs): Promise<Blueprint> {
+export async function generateBlueprint({ env, inferenceContext, query, language, frameworks, templateDetails, templateMetaInfo, images, stream }: BlueprintGenerationArgs): Promise<Blueprint> {
     try {
-        logger.info("Generating application blueprint", { query, queryLength: query.length });
+        logger.info("Generating application blueprint", { query, queryLength: query.length, imagesCount: images?.length || 0 });
         logger.info(templateDetails ? `Using template: ${templateDetails.name}` : "Not using a template.");
 
         // ---------------------------------------------------------------------------
         // Build the SYSTEM prompt for blueprint generation
         // ---------------------------------------------------------------------------
 
-        const systemPrompt = createSystemMessage(generalSystemPromptBuilder(SYSTEM_PROMPT, {
+        const filesText = TemplateRegistry.markdown.serialize(
+            { files: templateDetails.files.filter(f => !f.filePath.includes('package.json')) },
+            z.object({ files: z.array(TemplateFileSchema) })
+        );
+
+        const fileTreeText = PROMPT_UTILS.serializeTreeNodes(templateDetails.fileTree);
+        const systemPrompt = SYSTEM_PROMPT.replace('{{filesText}}', filesText).replace('{{fileTreeText}}', fileTreeText);
+        const systemPromptMessage = createSystemMessage(generalSystemPromptBuilder(systemPrompt, {
             query,
             templateDetails,
             frameworks,
             templateMetaInfo,
-            forCodegen: false,
             blueprint: undefined,
             language,
             dependencies: templateDetails.deps,
         }));
 
+        const userMessage = images && images.length > 0
+            ? createMultiModalUserMessage(
+                `CLIENT REQUEST: "${query}"`,
+                images.map(img => `data:${img.mimeType};base64,${img.base64Data}`),
+                'high'
+              )
+            : createUserMessage(`CLIENT REQUEST: "${query}"`);
+
         const messages = [
-            systemPrompt,
-            createUserMessage(`CLIENT REQUEST: "${query}"`)
+            systemPromptMessage,
+            userMessage
         ];
 
         // Log messages to console for debugging

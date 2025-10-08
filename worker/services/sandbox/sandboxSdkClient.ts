@@ -1,4 +1,4 @@
-import { getSandbox, Sandbox, ExecuteResponse } from '@cloudflare/sandbox';
+import { getSandbox, Sandbox, ExecuteResponse, parseSSEStream, LogEvent } from '@cloudflare/sandbox';
 
 import {
     TemplateDetailsResponse,
@@ -25,6 +25,7 @@ import {
     GitHubPushRequest, GitHubPushResponse, GitHubExportRequest, GitHubExportResponse,
     GetLogsResponse,
     ListInstancesResponse,
+    StoredError,
 } from './sandboxTypes';
 
 import { createObjectLogger } from '../../logger';
@@ -47,6 +48,7 @@ import { TemplateParser } from './templateParser';
 import { ResourceProvisioningResult } from './types';
 import { GitHubService } from '../github/GitHubService';
 import { getPreviewDomain } from '../../utils/urls';
+import { isDev } from 'worker/utils/envs';
 // Export the Sandbox class in your Worker
 export { Sandbox as UserAppSandboxService, Sandbox as DeployerService} from "@cloudflare/sandbox";
 
@@ -149,6 +151,26 @@ export class SandboxSdkClient extends BaseSandboxService {
         return this.sandbox;
     }
 
+    /** Write a binary file to the sandbox using small base64 chunks to avoid large control messages. */
+    private async writeBinaryFileViaBase64(targetPath: string, data: ArrayBuffer, bytesPerChunk: number = 16 * 1024): Promise<void> {
+        const sandbox = this.getSandbox();
+        const dir = targetPath.includes('/') ? targetPath.slice(0, targetPath.lastIndexOf('/')) : '.';
+        // Ensure directory and clean target file
+        await sandbox.exec(`mkdir -p '${dir}'`);
+        await sandbox.exec(`rm -f '${targetPath}'`);
+
+        const buffer = new Uint8Array(data);
+        for (let i = 0; i < buffer.length; i += bytesPerChunk) {
+            const chunk = buffer.subarray(i, Math.min(i + bytesPerChunk, buffer.length));
+            const base64Chunk = btoa(String.fromCharCode(...chunk));
+            // Append decoded bytes into the target file inside the sandbox
+            const appendResult = await sandbox.exec(`printf '%s' '${base64Chunk}' | base64 -d >> '${targetPath}'`);
+            if (appendResult.exitCode !== 0) {
+                throw new Error(`Failed to append to ${targetPath}: ${appendResult.stderr}`);
+            }
+        }
+    }
+
     private getInstanceMetadataFile(instanceId: string): string {
         return `${instanceId}-metadata.json`;
     }
@@ -171,6 +193,7 @@ export class SandboxSdkClient extends BaseSandboxService {
             this.metadataCache.set(instanceId, metadata); // Cache it
             return metadata;
         } catch (error) {
+            this.logger.error(`Failed to read instance metadata: ${error instanceof Error ? error.message : 'Unknown error'}`);
             throw new Error(`Failed to read instance metadata: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
@@ -243,22 +266,9 @@ export class SandboxSdkClient extends BaseSandboxService {
             this.logger.info(`Template doesnt exist, Downloading template from: ${templateName}`);
             
             const zipData = await this.downloadTemplate(templateName, downloadDir);
-
-            const zipBuffer = new Uint8Array(zipData);
-            // Convert Uint8Array to base64 using Web API (compatible with Cloudflare Workers)
-            // Process in chunks to avoid stack overflow on large files
-            let binaryString = '';
-            const chunkSize = 0x8000; // 32KB chunks
-            for (let i = 0; i < zipBuffer.length; i += chunkSize) {
-                const chunk = zipBuffer.subarray(i, i + chunkSize);
-                binaryString += String.fromCharCode(...chunk);
-            }
-            const base64Data = btoa(binaryString);
-            await this.getSandbox().writeFile(`${templateName}.zip.b64`, base64Data);
-            
-            // Convert base64 back to binary zip file
-            await this.getSandbox().exec(`base64 -d ${templateName}.zip.b64 > ${templateName}.zip`);
-            this.logger.info(`Wrote and converted zip file to sandbox: ${templateName}.zip`);
+            // Stream zip to sandbox in safe base64 chunks and write directly as binary
+            await this.writeBinaryFileViaBase64(`${templateName}.zip`, zipData);
+            this.logger.info(`Wrote zip file to sandbox in chunks: ${templateName}.zip`);
             
             const setupResult = await this.getSandbox().exec(`unzip -o -q ${templateName}.zip -d ${isInstance ? '.' : templateName}`);
         
@@ -590,7 +600,7 @@ export class SandboxSdkClient extends BaseSandboxService {
         try {
             // Use CLI tools for enhanced monitoring instead of direct process start
             const process = await this.getSandbox().startProcess(
-                `monitor-cli process start --instance-id ${instanceId} --port ${port} -- bun run dev`, 
+                `VITE_LOGGER_TYPE=json monitor-cli process start --instance-id ${instanceId} --port ${port} -- bun run dev`, 
                 { cwd: instanceId }
             );
             this.logger.info('Development server started', { instanceId, processId: process.id });
@@ -746,6 +756,62 @@ export class SandboxSdkClient extends BaseSandboxService {
         }
     }
 
+    /*
+    * Starts a cloudflared tunnel for the specified instance
+    * Super usefulfor local development
+    */
+    private async startCloudflaredTunnel(instanceId: string, port: number): Promise<string> {
+        try {
+            const process = await this.getSandbox().startProcess(
+                `cloudflared tunnel --url http://localhost:${port}`, 
+                { cwd: instanceId }
+            );
+            this.logger.info(`Started cloudflared tunnel for ${instanceId}`);
+
+            // Stream process logs to extract the preview URL
+            const logStream = await this.getSandbox().streamProcessLogs(process.id);
+            
+            return new Promise<string>((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    // reject(new Error('Timeout waiting for cloudflared tunnel URL'));
+                    this.logger.warn('Timeout waiting for cloudflared tunnel URL');
+                    resolve('');
+                }, 20000); // 20 second timeout
+
+                const processLogs = async () => {
+                    try {
+                        for await (const event of parseSSEStream<LogEvent>(logStream)) {
+                            if (event.data) {
+                                const logLine = event.data;
+                                this.logger.info(`Cloudflared log ===> ${logLine}`);
+                                
+                                // Look for the preview URL in the logs
+                                // Format: https://subdomain.trycloudflare.com
+                                const urlMatch = logLine.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+                                if (urlMatch) {
+                                    clearTimeout(timeout);
+                                    const previewURL = urlMatch[0];
+                                    this.logger.info(`Found cloudflared tunnel URL: ${previewURL}`);
+                                    resolve(previewURL);
+                                    return;
+                                }
+                            }
+                        }
+                    } catch (error) {
+                        this.logger.error('Cloudflare tunnel process failed', error);
+                        clearTimeout(timeout);
+                        reject(error);
+                    }
+                };
+
+                processLogs();
+            });
+        } catch (error) {
+            this.logger.warn('Failed to start cloudflared tunnel', error);
+            throw error;
+        }
+    }
+
     /**
      * Updates project configuration files with the specified project name
      */
@@ -806,9 +872,19 @@ export class SandboxSdkClient extends BaseSandboxService {
             // Allocate single port for both dev server and tunnel
             const allocatedPort = await this.allocateAvailablePort();
 
+            // If on local development, start cloudflared tunnel
+            let tunnelUrlPromise = Promise.resolve('');
+            if (isDev(env) || env.USE_TUNNEL_FOR_PREVIEW) {
+                this.logger.info('Starting cloudflared tunnel for local development', { instanceId });
+                tunnelUrlPromise = this.startCloudflaredTunnel(instanceId, allocatedPort);
+            }
+
             this.logger.info('Installing dependencies', { instanceId });
-            const installResult = await this.executeCommand(instanceId, `bun install`);
-            this.logger.info('Dependencies installed', { instanceId });
+            const [installResult, tunnelURL] = await Promise.all([
+                this.executeCommand(instanceId, `bun install`, 40000),
+                tunnelUrlPromise
+            ]);
+            this.logger.info('Dependencies installed', { instanceId, tunnelURL });
                 
             if (installResult.exitCode === 0) {
                 // Try to start development server in background
@@ -823,23 +899,22 @@ export class SandboxSdkClient extends BaseSandboxService {
                     // Expose the same port for preview URL
                     const previewResult = await sandbox.exposePort(allocatedPort, { hostname: getPreviewDomain(env) });
                     let previewURL = previewResult.url;
-                    const previewDomain = getPreviewDomain(env);
-                    if (previewDomain) {
-                        // Replace CUSTOM_DOMAIN with previewDomain in previewURL
-                        previewURL = previewURL.replace(env.CUSTOM_DOMAIN, previewDomain);
+                    if (!isDev(env)) {
+                        const previewDomain = getPreviewDomain(env);
+                        if (previewDomain) {
+                            // Replace CUSTOM_DOMAIN with previewDomain in previewURL
+                            previewURL = previewURL.replace(env.CUSTOM_DOMAIN, previewDomain);
+                        }
+                    }
+
+                    if(env.USE_TUNNEL_FOR_PREVIEW) {
+                        this.logger.info('Using tunnel url instead for preview as configured', { instanceId, tunnelURL });
+                        previewURL = tunnelURL;
                     }
                         
                     this.logger.info('Preview URL exposed', { instanceId, previewURL });
-
-                    // In the background, run an iteration of static analysis to build up cache
-                    Promise.allSettled([
-                        this.executeCommand(instanceId, `bun run lint`),
-                        this.executeCommand(instanceId, `bunx tsc -b --incremental --noEmit --pretty false`)
-                    ]).then(() => {
-                        this.logger.info('Static analysis completed', { instanceId });
-                    });
                         
-                    return { previewURL, tunnelURL: '', processId, allocatedPort };
+                    return { previewURL, tunnelURL, processId, allocatedPort };
                 } catch (error) {
                     this.logger.warn('Failed to start dev server', error);
                     return undefined;
@@ -886,6 +961,34 @@ export class SandboxSdkClient extends BaseSandboxService {
 
     async createInstance(templateName: string, projectName: string, webhookUrl?: string, localEnvVars?: Record<string, string>): Promise<BootstrapResponse> {
         try {
+            if (env.ALLOCATION_STRATEGY === 'one_to_one') {
+                // Multiple instances shouldn't exist in the same sandbox
+
+                // If there are already instances running in sandbox, log them
+                const instancesResp = await this.listAllInstances();
+                if (instancesResp.success && instancesResp.instances.length > 0) {
+                    this.logger.error('There are already instances running in sandbox, creating a new instance may cause issues', { instances: instancesResp.instances });
+                    // Try to see if this instance actually exists and if the process is active
+                    const firstInstance = instancesResp.instances[0];
+                    const instanceStatus = await this.getInstanceStatus(firstInstance.runId);
+                    if (instanceStatus.success && instanceStatus.isHealthy) {
+                        this.logger.error('Instance already exists and is active, creating a new instance may cause issues', { instance: firstInstance });
+                        // Return instance information
+                        return {
+                            success: true,
+                            runId: firstInstance.runId,
+                            previewURL: instanceStatus.previewURL,
+                            tunnelURL: instanceStatus.tunnelURL,
+                            processId: instanceStatus.processId,
+                            message: instanceStatus.message
+                        };
+                    } else {
+                        this.logger.error('Instance already exists but is not active, Removing old instance', { instance: firstInstance });
+                        await this.shutdownInstance(firstInstance.runId);
+                    }
+                }
+            }
+            
             const instanceId = `i-${generateId()}`;
             this.logger.info('Creating sandbox instance', { instanceId, templateName, projectName });
             
@@ -1011,6 +1114,7 @@ export class SandboxSdkClient extends BaseSandboxService {
                         const process = await this.getSandbox().getProcess(metadata.processId);
                         isHealthy = !!(process && process.status === 'running');
                     } catch {
+                        this.logger.error(`Process ${metadata.processId} not found or not running`);
                         isHealthy = false; // Process not found or not running
                     }
                 }
@@ -1053,11 +1157,13 @@ export class SandboxSdkClient extends BaseSandboxService {
             this.logger.info(`Shutting down instance: ${instanceId}`);
 
             const sandbox = this.getSandbox();
-
-            // Kill all processes
-            const processes = await sandbox.listProcesses();
-            for (const process of processes) {
-                await sandbox.killProcess(process.id);
+            
+            if (metadata.processId) {
+                try {
+                    await sandbox.killProcess(metadata.processId);
+                } catch (error) {
+                    this.logger.warn(`Failed to kill process ${metadata.processId}`, error);
+                }
             }
             
             // Unexpose the allocated port if we know what it was
@@ -1068,20 +1174,10 @@ export class SandboxSdkClient extends BaseSandboxService {
                 } catch (error) {
                     this.logger.warn(`Failed to unexpose port ${metadata.allocatedPort}`, error);
                 }
-            } else {
-                // Fallback: try to unexpose all exposed ports
-                try {
-                    const exposedPorts = await sandbox.getExposedPorts('localhost');
-                    for (const port of exposedPorts) {
-                        await sandbox.unexposePort(port.port);
-                    }
-                } catch {
-                    // Ports may not be exposed
-                }
             }
             
             // Clean up files
-            await sandbox.exec('rm -rf /app/*');
+            await sandbox.exec(`rm -rf /app/${instanceId}`);
 
             // Invalidate cache since instance is being shutdown
             this.invalidateMetadataCache(instanceId);
@@ -1332,15 +1428,7 @@ export class SandboxSdkClient extends BaseSandboxService {
                     });
                     
                     if (result.exitCode !== 0) {
-                        const error: RuntimeError = {
-                            timestamp: new Date(),
-                            message: `Command failed: ${command}`,
-                            stack: result.stderr,
-                            severity: 'error',
-                            source: 'command_execution',
-                            rawOutput: `Command: ${command}\nExit code: ${result.exitCode}\nSTDOUT: ${result.stdout}\nSTDERR: ${result.stderr}`
-                        };
-                        this.logger.error('Command execution failed', { command, error });
+                        this.logger.error('Command execution failed', { command, error: result.stderr });
                     }
                     
                     this.logger.info('Command executed', { command, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr });
@@ -1383,37 +1471,21 @@ export class SandboxSdkClient extends BaseSandboxService {
     async getInstanceErrors(instanceId: string, clear?: boolean): Promise<RuntimeErrorResponse> {
         try {
             let errors: RuntimeError[] = [];
-            const cmd = `timeout 3s monitor-cli errors list -i ${instanceId} --format json`;
+            const cmd = `timeout 3s monitor-cli errors list -i ${instanceId} --format json ${clear ? '--reset' : ''}`;
             const result = await this.executeCommand(instanceId, cmd, 15000);
             
             if (result.exitCode === 0) {
-                let response: any;
+                let response: {success: boolean, errors: StoredError[]};
                 try {
                     response = JSON.parse(result.stdout);
-                    this.logger.info('getInstanceErrors', result.stdout);
+                    this.logger.info(`getInstanceErrors - ${response.errors.length ? 'errors found' : ''}: ${result.stdout}`);
                 } catch (parseError) {
                     this.logger.warn('Failed to parse CLI output as JSON', { stdout: result.stdout });
                     throw new Error('Invalid JSON response from CLI tools');
                 }
                 if (response.success && response.errors) {
                     // Convert StoredError objects to RuntimeError format
-                    // CLI returns StoredError objects with snake_case field names
-                    errors = response.errors.map((err: Record<string, unknown>) => ({
-                        timestamp: err.last_occurrence || err.created_at,
-                        message: String(err.message || ''),
-                        // stack: err.stack_trace ? String(err.stack_trace) : undefined, // Commented out to save memory
-                        // source: undefined, // Commented out - not needed for now
-                        filePath: err.source_file ? String(err.source_file) : undefined,
-                        lineNumber: typeof err.line_number === 'number' ? err.line_number : undefined,
-                        columnNumber: typeof err.column_number === 'number' ? err.column_number : undefined,
-                        severity: this.mapSeverityToLegacy(String(err.severity || 'error')),
-                        rawOutput: err.raw_output ? String(err.raw_output) : undefined
-                    }));
-
-                    // Auto-clear if requested
-                    if (clear && errors.length > 0) {
-                        this.clearInstanceErrors(instanceId);   // Call in the background
-                    }
+                    errors = response.errors;
 
                     return {
                         success: true,
@@ -2368,21 +2440,5 @@ export class SandboxSdkClient extends BaseSandboxService {
 
         this.logger.info(`Successfully read ${files.length}/${filePaths.length} files for GitHub push`);
         return files;
-    }
-
-    /**
-     * Map enhanced severity levels to legacy format for backward compatibility
-     */
-    private mapSeverityToLegacy(severity: string): 'warning' | 'error' | 'fatal' {
-        switch (severity) {
-            case 'fatal':
-                return 'fatal';
-            case 'error':
-                return 'error';
-            case 'warning':
-            case 'info':
-            default:
-                return 'warning';
-        }
     }
 }

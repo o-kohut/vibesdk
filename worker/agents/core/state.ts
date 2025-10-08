@@ -7,9 +7,10 @@ import type { ConversationMessage } from '../inferutils/common';
 import type { InferenceContext } from '../inferutils/config.types';
 
 export interface FileState extends FileOutputType {
-    last_hash: string;
-    last_modified: number;
+    lasthash: string;
+    lastmodified: number;
     unmerged: string[];
+    lastDiff: string;
 }
 
 export interface PhaseState extends PhaseConceptType {
@@ -36,7 +37,7 @@ export interface CodeGenState {
     generatedPhases: PhaseState[];
     commandsHistory?: string[]; // History of commands run
     lastPackageJson?: string; // Last package.json file contents
-    templateDetails: TemplateDetails;
+    templateDetails: TemplateDetails;   // TODO: Remove this from state and rely on directly fetching from sandbox
     sandboxInstanceId?: string;
     // previewURL?: string;
     // tunnelURL?: string;
@@ -56,5 +57,6 @@ export interface CodeGenState {
     currentPhase?: PhaseConceptType; // Current phase being worked on
     
     conversationMessages: ConversationMessage[];
+    projectUpdatesAccumulator: string[];
     inferenceContext: InferenceContext;
 }  

@@ -4,11 +4,13 @@ import { Message } from "../inferutils/common";
 import { InferenceContext } from "../inferutils/config.types";
 import { createUserMessage, createSystemMessage, createAssistantMessage } from "../inferutils/common";
 import { generalSystemPromptBuilder, USER_PROMPT_FORMATTER } from "../prompts";
+import { CodeSerializerType } from "../utils/codeSerializers";
+import { CodingAgentInterface } from "../services/implementations/CodingAgent";
 
 export function getSystemPromptWithProjectContext(
     systemPrompt: string,
     context: GenerationContext,
-    forCodeGen: boolean
+    serializerType: CodeSerializerType = CodeSerializerType.SIMPLE
 ): Message[] {
     const { query, blueprint, templateDetails, dependencies, allFiles, commandsHistory } = context;
 
@@ -18,13 +20,14 @@ export function getSystemPromptWithProjectContext(
             blueprint,
             templateDetails,
             dependencies,
-            forCodegen: forCodeGen,
         })), 
         createUserMessage(
             USER_PROMPT_FORMATTER.PROJECT_CONTEXT(
                 context.getCompletedPhases(),
                 allFiles, 
-                commandsHistory
+                context.getFileTree(),
+                commandsHistory,
+                serializerType  
             )
         ),
         createAssistantMessage(`I have thoroughly gone through the whole codebase and understood the current implementation and project requirements. We can continue.`)
@@ -38,6 +41,7 @@ export interface OperationOptions {
     context: GenerationContext;
     logger: StructuredLogger;
     inferenceContext: InferenceContext;
+    agent: CodingAgentInterface;
 }
 
 export abstract class AgentOperation<InputType, OutputType> {
