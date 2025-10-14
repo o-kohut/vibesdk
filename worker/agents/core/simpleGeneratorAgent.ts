@@ -1,4 +1,4 @@
-import { Agent, Connection } from 'agents';
+import { Agent, AgentContext, Connection } from 'agents';
 import { 
     Blueprint, 
     PhaseConceptGenerationSchemaType, 
@@ -41,9 +41,12 @@ import { prepareCloudflareButton } from '../../utils/deployToCf';
 import { AppService } from '../../database';
 import { RateLimitExceededError } from 'shared/types/errors';
 import { generateId } from 'worker/utils/idGenerator';
-import type { ImageAttachment } from '../../types/image-attachment';
+import { ImageAttachment, type ProcessedImageAttachment } from '../../types/image-attachment';
 import { OperationOptions } from '../operations/common';
 import { CodingAgentInterface } from '../services/implementations/CodingAgent';
+import { generateAppProxyToken, generateAppProxyUrl } from 'worker/services/aigateway-proxy/controller';
+import { ImageType, uploadImage } from 'worker/utils/images';
+import { ConversationMessage, ConversationState } from '../inferutils/common';
 
 interface WebhookPayload {
     event: {
@@ -78,15 +81,16 @@ interface Operations {
     processUserMessage: UserConversationProcessor;
 }
 
+const DEFAULT_CONVERSATION_SESSION_ID = 'default';
+
 /**
- * SimpleCodeGeneratorAgent - Deterministically orhestrated AI-powered code generation
+ * SimpleCodeGeneratorAgent - Deterministically orhestrated agent
  * 
  * Manages the lifecycle of code generation including:
- * - Blueprint-based phase generation
- * - Real-time file streaming with WebSocket updates
+ * - Blueprint, phase generation, phase implementation, review cycles orchestrations
+ * - File streaming with WebSocket updates
  * - Code validation and error correction
  * - Deployment to sandbox service
- * - Review cycles with automated fixes
  */
 export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     protected projectSetupAssistant: ProjectSetupAssistant | undefined;
@@ -100,7 +104,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     
     // In-memory storage for user-uploaded images (not persisted in DO state)
     // These are temporary and will be lost if the DO is evicted
-    private pendingUserImages: ImageAttachment[] = [];
+    private pendingUserImages: ProcessedImageAttachment[] = []
     
     protected operations: Operations = {
         codeReview: new CodeReviewOperation(),
@@ -121,96 +125,26 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     
     public _logger: StructuredLogger | undefined;
 
+    private initLogger(agentId: string, sessionId: string, userId: string) {
+        this._logger = createObjectLogger(this, 'CodeGeneratorAgent');
+        this._logger.setObjectId(agentId);
+        this._logger.setFields({
+            sessionId,
+            agentId,
+            userId,
+        });
+        return this._logger;
+    }
+
     logger(): StructuredLogger {
         if (!this._logger) {
-            this._logger = createObjectLogger(this, 'CodeGeneratorAgent');
-            this._logger.setObjectId(this.getAgentId());
-            this._logger.setFields({
-                sessionId: this.state.sessionId,
-                agentId: this.getAgentId(),
-                userId: this.state.inferenceContext.userId,
-            });
+            this._logger = this.initLogger(this.getAgentId(), this.state.sessionId, this.state.inferenceContext.userId);
         }
         return this._logger;
     }
 
     getAgentId() {
         return this.state.inferenceContext.agentId
-    }
-
-    // ===============================
-    // Screenshot storage helpers
-    // ===============================
-    private base64ToUint8Array(base64: string): Uint8Array {
-        const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes;
-    }
-
-    private async uploadScreenshotToCloudflareImages(base64: string, filename: string): Promise<string> {
-        const url = `https://api.cloudflare.com/client/v4/accounts/${this.env.CLOUDFLARE_ACCOUNT_ID}/images/v1`;
-        const bytes = this.base64ToUint8Array(base64);
-        const blob = new Blob([bytes], { type: 'image/png' });
-        const form = new FormData();
-        form.append('file', blob, filename);
-
-        // Type guard for Images binding
-        type ImagesBinding = { fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> };
-        const maybeImages = (this.env as unknown as { [key: string]: unknown })['IMAGES'];
-        const imagesBinding: ImagesBinding | null = (
-            typeof maybeImages === 'object' && maybeImages !== null &&
-            'fetch' in (maybeImages as Record<string, unknown>) && 
-            typeof (maybeImages as { fetch?: unknown }).fetch === 'function'
-        ) ? (maybeImages as ImagesBinding) : null;
-
-        let resp: Response;
-        if (imagesBinding) {
-            // Use Images service binding when available (no explicit token needed)
-            resp = await imagesBinding.fetch(url, { method: 'POST', body: form });
-        } else if (this.env.CLOUDFLARE_API_TOKEN) {
-            // Fallback to direct API with token
-            resp = await fetch(url, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${this.env.CLOUDFLARE_API_TOKEN}` },
-                body: form,
-            });
-        } else {
-            throw new Error('Cloudflare Images not available: missing IMAGES binding and CLOUDFLARE_API_TOKEN');
-        }
-
-        const json = await resp.json() as {
-            success: boolean;
-            result?: { id: string; variants?: string[] };
-            errors?: Array<{ message?: string }>;
-        };
-
-        if (!resp.ok || !json.success || !json.result) {
-            const errMsg = json.errors?.map(e => e.message).join('; ') || `status ${resp.status}`;
-            throw new Error(`Cloudflare Images upload failed: ${errMsg}`);
-        }
-
-        const variants = json.result.variants || [];
-        if (variants.length > 0) {
-            // Prefer first variant URL
-            return variants[0];
-        }
-        throw new Error('Cloudflare Images upload succeeded without variants');
-    }
-
-    private async uploadScreenshotToR2(base64: string, key: string): Promise<string> {
-        const bytes = this.base64ToUint8Array(base64);
-        await this.env.TEMPLATES_BUCKET.put(key, bytes, { httpMetadata: { contentType: 'image/png' } });
-
-        // Build a public URL served via Worker route
-        const fileName = key.split('/').pop() as string;
-        const protocol = getProtocolForHost(this.state.hostname);
-        const base = `${protocol}://${this.env.CUSTOM_DOMAIN}`;
-        const agentId = this.state.inferenceContext.agentId;
-        const url = `${base}/api/screenshots/${encodeURIComponent(agentId)}/${encodeURIComponent(fileName)}`;
-        return url;
     }
 
     initialState: CodeGenState = {
@@ -225,10 +159,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         commandsHistory: [],
         lastPackageJson: '',
         clientReportedErrors: [],
-        // latestScreenshot: undefined,
         pendingUserInputs: [],
         inferenceContext: {} as InferenceContext,
-        // conversationalAssistant: new ConversationalAssistant(this.env),
         sessionId: '',
         hostname: '',
         conversationMessages: [],
@@ -239,6 +171,65 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         reviewingInitiated: false,
         projectUpdatesAccumulator: [],
     };
+
+    /*
+    * Each DO has 10 gb of sqlite storage. However, the way agents sdk works, it stores the 'state' object of the agent as a single row
+    * in the cf_agents_state table. And row size has a much smaller limit in sqlite. Thus, we only keep current compactified conversation
+    * in the agent's core state and store the full conversation in a separate DO table.
+    */
+    getConversationState(id: string = DEFAULT_CONVERSATION_SESSION_ID): ConversationState {
+        const currentConversation = this.state.conversationMessages;
+        const rows = this.sql<{ messages: string, id: string }>`SELECT * FROM full_conversations WHERE id = ${id}`;
+        let fullHistory: ConversationMessage[] = [];
+        if (rows.length > 0 && rows[0].messages) {
+            try {
+                const parsed = JSON.parse(rows[0].messages);
+                if (Array.isArray(parsed)) {
+                    fullHistory = parsed as ConversationMessage[];
+                }
+            } catch (_e) {}
+        }
+        if (fullHistory.length === 0) {
+            fullHistory = currentConversation;
+        }
+        // Load compact (running) history from sqlite with fallback to in-memory state for migration
+        const compactRows = this.sql<{ messages: string, id: string }>`SELECT * FROM compact_conversations WHERE id = ${id}`;
+        let runningHistory: ConversationMessage[] = [];
+        if (compactRows.length > 0 && compactRows[0].messages) {
+            try {
+                const parsed = JSON.parse(compactRows[0].messages);
+                if (Array.isArray(parsed)) {
+                    runningHistory = parsed as ConversationMessage[];
+                }
+            } catch (_e) {}
+        }
+        if (runningHistory.length === 0) {
+            runningHistory = currentConversation;
+        }
+        return {
+            id: id,
+            runningHistory,
+            fullHistory,
+        };
+    }
+
+    setConversationState(conversations: ConversationState) {
+        const serializedFull = JSON.stringify(conversations.fullHistory);
+        const serializedCompact = JSON.stringify(conversations.runningHistory);
+        try {
+            this.logger().info(`Saving conversation state ${conversations.id}, full_length: ${serializedFull.length}, compact_length: ${serializedCompact.length}`);
+            this.sql`INSERT OR REPLACE INTO compact_conversations (id, messages) VALUES (${conversations.id}, ${serializedCompact})`;
+            this.sql`INSERT OR REPLACE INTO full_conversations (id, messages) VALUES (${conversations.id}, ${serializedFull})`;
+        } catch (error) {
+            this.logger().error(`Failed to save conversation state ${conversations.id}`, error);
+        }
+    }
+
+    constructor(ctx: AgentContext, env: Env) {
+        super(ctx, env);
+        this.sql`CREATE TABLE IF NOT EXISTS full_conversations (id TEXT PRIMARY KEY, messages TEXT)`;
+        this.sql`CREATE TABLE IF NOT EXISTS compact_conversations (id TEXT PRIMARY KEY, messages TEXT)`;
+    }
 
     async saveToDatabase() {
         this.logger().info(`Blueprint generated successfully for agent ${this.getAgentId()}`);
@@ -276,6 +267,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     ): Promise<CodeGenState> {
 
         const { query, language, frameworks, hostname, inferenceContext, templateInfo, sandboxSessionId } = initArgs;
+        this.initLogger(inferenceContext.agentId, sandboxSessionId, inferenceContext.userId);
+        
         // Generate a blueprint
         this.logger().info('Generating blueprint', { query, queryLength: query.length, imagesCount: initArgs.images?.length || 0 });
         this.logger().info(`Using language: ${language}, frameworks: ${frameworks ? frameworks.join(", ") : "none"}`);
@@ -383,7 +376,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
 
     resetSessionId() {
         const newSessionId = generateId();
-        this.logger().info(`New Sandbox sessionId initialized: ${newSessionId}`)
+        this.logger().info(`New Sandbox sessionId initialized: ${newSessionId}. Old sessionId: ${this.state.sessionId}`)
         this.setState({
             ...this.state,
             sessionId: newSessionId
@@ -401,7 +394,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     getSandboxServiceClient(): BaseSandboxService {
         if (this.sandboxServiceClient === undefined) {
             this.logger().info('Initializing sandbox service client');
-            this.sandboxServiceClient = getSandboxService(this.getSessionId());
+            this.sandboxServiceClient = getSandboxService(this.getSessionId(), this.getAgentId());
         }
         return this.sandboxServiceClient;
     }
@@ -468,7 +461,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         this.logger().info('README.md generated successfully');
     }
 
-    async queueUserRequest(request: string, images?: ImageAttachment[]): Promise<void> {
+    async queueUserRequest(request: string, images?: ProcessedImageAttachment[]): Promise<void> {
         this.rechargePhasesCounter(3);
         this.setState({
             ...this.state,
@@ -477,7 +470,6 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         if (images && images.length > 0) {
             this.logger().info('Storing user images in-memory for phase generation', {
                 imageCount: images.length,
-                filenames: images.map(img => img.filename)
             });
             this.pendingUserImages = [...this.pendingUserImages, ...images];
         }
@@ -1010,7 +1002,9 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         if (finalFiles.length > 0) {
             await this.deployToSandbox(finalFiles, false, phase.name);
             await this.applyDeterministicCodeFixes();
-            // await this.applyFastSmartCodeFixes();
+            if (this.state.inferenceContext.enableFastSmartCodeFix) {
+                await this.applyFastSmartCodeFixes();
+            }
         }
 
         // Validation complete
@@ -1401,6 +1395,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     }
 
     async fetchRuntimeErrors(clear: boolean = true) {
+        await this.waitForPreview();
+
         if (!this.state.sandboxInstanceId || !this.fileManager) {
             this.logger().warn("No sandbox instance ID available to fetch errors from.");
             return [];
@@ -1500,44 +1496,38 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         }
     }
 
-    // private async applyFastSmartCodeFixes() : Promise<void> {
-    //     try {
-    //         const startTime = Date.now();
-    //         this.logger().info("Applying fast smart code fixes");
-    //         // Get static analysis and do deterministic fixes
-    //         const staticAnalysis = await this.runStaticAnalysisCode();
-    //         if (staticAnalysis.typecheck.issues.length + staticAnalysis.lint.issues.length == 0) {
-    //             this.logger().info("No issues found, skipping fast smart code fixes");
-    //             return;
-    //         }
-    //         const issues = staticAnalysis.typecheck.issues.concat(staticAnalysis.lint.issues);
-    //         const allFiles = this.fileManager.getAllFiles();
-    //         const context = GenerationContext.from(this.state, this.logger());
+    private async applyFastSmartCodeFixes() : Promise<void> {
+        try {
+            const startTime = Date.now();
+            this.logger().info("Applying fast smart code fixes");
+            // Get static analysis and do deterministic fixes
+            const staticAnalysis = await this.runStaticAnalysisCode();
+            if (staticAnalysis.typecheck.issues.length + staticAnalysis.lint.issues.length == 0) {
+                this.logger().info("No issues found, skipping fast smart code fixes");
+                return;
+            }
+            const issues = staticAnalysis.typecheck.issues.concat(staticAnalysis.lint.issues);
+            const allFiles = this.fileManager.getAllFiles();
 
-    //         const fastCodeFixer = await this.operations.fastCodeFixer.execute({
-    //             query: this.state.query,
-    //             issues,
-    //             allFiles,
-    //         }, {
-    //             env: this.env,
-    //             agentId: this.getAgentId(),
-    //             context,
-    //             logger: this.logger()
-    //         });
+            const fastCodeFixer = await this.operations.fastCodeFixer.execute({
+                query: this.state.query,
+                issues,
+                allFiles,
+            }, this.getOperationOptions());
 
-    //         if (fastCodeFixer.length > 0) {
-    //             this.fileManager.saveGeneratedFiles(fastCodeFixer);
-    //             await this.deployToSandbox(fastCodeFixer);
-    //             this.logger().info("Fast smart code fixes applied successfully");
-    //         }
-    //         this.logger().info(`Fast smart code fixes applied in ${Date.now() - startTime}ms`);            
-    //     } catch (error) {
-    //         this.logger().error("Error applying fast smart code fixes:", error);
-    //         const errorMessage = error instanceof Error ? error.message : String(error);
-    //         this.broadcast(WebSocketMessageResponses.ERROR, { error: `Failed to apply fast smart code fixes: ${errorMessage}` });
-    //         return;
-    //     }
-    // }
+            if (fastCodeFixer.length > 0) {
+                this.fileManager.saveGeneratedFiles(fastCodeFixer);
+                await this.deployToSandbox(fastCodeFixer);
+                this.logger().info("Fast smart code fixes applied successfully");
+            }
+            this.logger().info(`Fast smart code fixes applied in ${Date.now() - startTime}ms`);            
+        } catch (error) {
+            this.logger().error("Error applying fast smart code fixes:", error);
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.broadcast(WebSocketMessageResponses.ERROR, { error: `Failed to apply fast smart code fixes: ${errorMessage}` });
+            return;
+        }
+    }
 
     /**
      * Apply deterministic code fixes for common TypeScript errors
@@ -1650,20 +1640,33 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         return { runtimeErrors, staticAnalysis, clientErrors };
     }
 
+    async waitForPreview(): Promise<void> {
+        this.logger().info("Waiting for preview");
+        if (!this.state.sandboxInstanceId) {
+            const preview = await this.deployToSandbox();
+            if (!preview) {
+                this.logger().error("Failed create preview");
+                return;
+            }
+        }
+        this.logger().info("Waiting for preview completed");
+    }
+
     async deployToSandbox(files: FileOutputType[] = [], redeploy: boolean = false, commitMessage?: string): Promise<PreviewType | null> {
         // If there's already a deployment in progress, wait for it to complete
         if (this.currentDeploymentPromise) {
             this.logger().info('Deployment already in progress, waiting for completion');
             try {
                 const result = await this.currentDeploymentPromise;
-                // If previous deployment succeeded, we're done!
-                // It already deployed all files from state, which includes our changes
-                this.logger().info('Previous deployment completed successfully, returning its result');
-                return result;
+                if (result) {
+                    this.logger().info('Previous deployment completed successfully, returning its result', { result });
+                    return result;
+                }
             } catch (error) {
                 // Only proceed with new deployment if previous one failed
                 this.logger().warn('Previous deployment failed, proceeding with new deployment:', error);
             }
+            return null;
         }
     
         this.logger().info("Deploying to sandbox", { files, redeploy, commitMessage, sessionId: this.state.sessionId });
@@ -1707,8 +1710,17 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         
         // Generate webhook URL for this agent instance
         const webhookUrl = this.generateWebhookUrl();
+
+        // If AI template is configured, pass AI vars
+        let localEnvVars: Record<string, string> = {};
+        if (this.state.templateDetails.name.includes('agents')) {
+            localEnvVars = {
+                "CF_AI_BASE_URL": generateAppProxyUrl(this.env),
+                "CF_AI_API_KEY": await generateAppProxyToken(this.state.inferenceContext.agentId, this.state.inferenceContext.userId, this.env)
+            }
+        }
         
-        const createResponse = await this.getSandboxServiceClient().createInstance(templateName, `v1-${projectName}`, webhookUrl);
+        const createResponse = await this.getSandboxServiceClient().createInstance(templateName, `v1-${projectName}`, webhookUrl, localEnvVars);
         if (!createResponse || !createResponse.success || !createResponse.runId) {
             throw new Error(`Failed to create sandbox instance: ${createResponse?.error || 'Unknown error'}`);
         }
@@ -1786,7 +1798,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                 }
                 
                 const status = await this.getSandboxServiceClient().getInstanceStatus(sandboxInstanceId!);
-                if (!status || !status.success) {
+                if (!status || !status.success || !status.isHealthy) {
                     this.logger().error(`DEPLOYMENT CHECK FAILED: Failed to get status for instance ${sandboxInstanceId}, redeploying...`);
                     // Clear the interval to prevent it from running again
                     if (this.healthCheckInterval !== null) {
@@ -1810,16 +1822,16 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     }
 
     private async executeDeployment(files: FileOutputType[] = [], redeploy: boolean = false, commitMessage?: string, retries: number = MAX_DEPLOYMENT_RETRIES): Promise<PreviewType | null> {
-        this.broadcast(WebSocketMessageResponses.DEPLOYMENT_STARTED, {
-            message: "Deploying code to sandbox service",
-            files: files.map(file => ({
-                filePath: file.filePath,
-            }))
-        });
-
-        this.logger().info("Deploying code to sandbox service");
-
         try {
+            this.broadcast(WebSocketMessageResponses.DEPLOYMENT_STARTED, {
+                message: "Deploying code to sandbox service",
+                files: files.map(file => ({
+                    filePath: file.filePath,
+                }))
+            });
+    
+            this.logger().info("Deploying code to sandbox service");
+    
             const {
                 sandboxInstanceId,
                 previewURL,
@@ -1859,7 +1871,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
 
             return preview;
         } catch (error) {
-            this.logger().error("Error deploying to sandbox service:", error);
+            this.logger().error("Error deploying to sandbox service:", error, { sessionId: this.state.sessionId, sandboxInstanceId: this.state.sandboxInstanceId });
             const errorMsg = error instanceof Error ? error.message : String(error);
             if (errorMsg.includes('Network connection lost') || errorMsg.includes('Container service disconnected') || errorMsg.includes('Internal error in Durable Object storage')) {
                 // For this particular error, reset the sandbox sessionId
@@ -1891,6 +1903,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     async deployToCloudflare(): Promise<{ deploymentUrl?: string; workersUrl?: string } | null> {
         try {
             this.logger().info('Starting Cloudflare deployment');
+            await this.waitForPreview();
             this.broadcast(WebSocketMessageResponses.CLOUDFLARE_DEPLOYMENT_STARTED, {
                 message: 'Starting deployment to Cloudflare Workers...',
                 instanceId: this.state.sandboxInstanceId,
@@ -2145,21 +2158,6 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         });
     }
 
-    // /**
-    //  * Get project dependencies from state and package.json
-    //  */
-    // private getDependencies(): Record<string, string> {
-    //     const state = this.state;
-    //     const deps = state.templateDetails?.deps || {};
-    //     // Add additional dependencies from the last package.json
-    //     if (state.lastPackageJson) {
-    //         const parsedPackageJson = JSON.parse(state.lastPackageJson);
-    //         Object.assign(deps, parsedPackageJson.dependencies as Record<string, string>);
-    //         this.logger().info(`Adding dependencies from last package.json: ${Object.keys(parsedPackageJson.dependencies).join(', ')}`);
-    //     }
-    //     return deps;
-    // }
-
     /**
      * Execute commands with retry logic
      * Chunks commands and retries failed ones with AI assistance
@@ -2346,6 +2344,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                 throw new Error('No generated files available for export');
             }
 
+            await this.waitForPreview();
+
             // Broadcast export started
             this.broadcast(WebSocketMessageResponses.GITHUB_EXPORT_STARTED, {
                 message: `Starting GitHub export to repository "${options.cloneUrl}"`,
@@ -2360,9 +2360,10 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                 step: 'uploading_files',
                 progress: 30
             });
-
+            
+            const allFiles = this.fileManager.getGeneratedFiles();
             // Use consolidated export method that handles the complete flow
-            const exportResult = await this.getSandboxServiceClient().pushToGitHub(this.state.sandboxInstanceId!, options);
+            const exportResult = await this.getSandboxServiceClient().pushToGitHub(this.state.sandboxInstanceId!, options, allFiles);
 
             if (!exportResult?.success) {
                 throw new Error(`Failed to export to GitHub repository: ${exportResult?.error}`);
@@ -2379,7 +2380,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                     this.fileManager.saveGeneratedFile(readmeFile);
                     await this.deployToSandbox([readmeFile], false, "feat: README updated with cloudflare deploy button");
                     // Export again
-                    await this.getSandboxServiceClient().pushToGitHub(this.state.sandboxInstanceId!, options);
+                    await this.getSandboxServiceClient().pushToGitHub(this.state.sandboxInstanceId!, options, allFiles);
                     this.logger().info('Readme committed successfully');
                 } catch (error) {
                     this.logger().error('Failed to commit readme', error);
@@ -2441,11 +2442,21 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             const projectUpdates = await this.getAndResetProjectUpdates();
             this.logger().info('Passing context to user conversation processor', { errors, projectUpdates });
 
+            // If there are images, upload them and pass the URLs to the conversation processor
+            let uploadedImages: ProcessedImageAttachment[] = [];
+            if (images) {
+                uploadedImages = await Promise.all(images.map(async (image) => {
+                    return await uploadImage(this.env, image, ImageType.UPLOADS);
+                }));
+
+                this.logger().info('Uploaded images', { uploadedImages });
+            }
+
             // Process the user message using conversational assistant
             const conversationalResponse = await this.operations.processUserMessage.execute(
                 { 
                     userMessage, 
-                    pastMessages: this.state.conversationMessages,
+                    conversationState: this.getConversationState(),
                     conversationResponseCallback: (
                         message: string,
                         conversationId: string,
@@ -2461,16 +2472,13 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                     },
                     errors,
                     projectUpdates,
-                    images
+                    images: uploadedImages
                 }, 
                 this.getOperationOptions()
             );
 
-            const { conversationResponse, messages } = conversationalResponse;
-            this.setState({
-                ...this.state,
-                conversationMessages: messages
-            });
+            const { conversationResponse, conversationState } = conversationalResponse;
+            this.setConversationState(conversationState);
 
              if (!this.isGenerating) {
                 // If idle, start generation process
@@ -2497,6 +2505,25 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                 error: `Error processing user input: ${error instanceof Error ? error.message : String(error)}`
             });
         }
+    }
+
+    /**
+     * Clear conversation history
+     */
+    public clearConversation(): void {
+        const messageCount = this.state.conversationMessages.length;
+                        
+        // Clear conversation messages only from agent's running history
+        this.setState({
+            ...this.state,
+            conversationMessages: []
+        });
+                        
+        // Send confirmation response
+        this.broadcast(WebSocketMessageResponses.CONVERSATION_CLEARED, {
+            message: 'Conversation history cleared',
+            clearedMessageCount: messageCount
+        });
     }
 
     /**
@@ -2593,38 +2620,18 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             
             // Get base64 screenshot data
             const base64Screenshot = result.result.screenshot;
-
-            // Prefer Cloudflare Images → then R2 → fallback to data URL
-            const fileStamp = Date.now();
-            const fileBase = `${this.getAgentId()}-${fileStamp}`;
-            let publicUrl: string | null = null;
-
-            // 1) Try Cloudflare Images (REST API)
-            try {
-                publicUrl = await this.uploadScreenshotToCloudflareImages(base64Screenshot, `${fileBase}.png`);
-            } catch (imgErr) {
-                this.logger().warn('Cloudflare Images upload failed, will try R2 fallback', { error: imgErr instanceof Error ? imgErr.message : String(imgErr) });
-            }
-
-            // 2) Try R2 (serve via Worker route) if Images failed
-            if (!publicUrl) {
-                try {
-                    const r2Key = `screenshots/${this.getAgentId()}/${fileBase}.png`;
-                    publicUrl = await this.uploadScreenshotToR2(base64Screenshot, r2Key);
-                } catch (r2Err) {
-                    this.logger().warn('R2 upload fallback failed, will store as data URL', { error: r2Err instanceof Error ? r2Err.message : String(r2Err) });
-                }
-            }
-
-            // 3) Fallback: store data URL directly in DB
-            if (!publicUrl) {
-                publicUrl = `data:image/png;base64,${base64Screenshot}`;
-            }
+            const screenshot: ImageAttachment = {
+                id: this.getAgentId(),
+                filename: 'latest.png',
+                mimeType: 'image/png',
+                base64Data: base64Screenshot
+            };
+            const uploadedImage = await uploadImage(this.env, screenshot, ImageType.SCREENSHOTS);
 
             // Persist in database
             try {
                 const appService = new AppService(this.env);
-                await appService.updateAppScreenshot(this.getAgentId(), publicUrl);
+                await appService.updateAppScreenshot(this.getAgentId(), uploadedImage.publicUrl);
             } catch (dbError) {
                 const error = `Database update failed: ${dbError instanceof Error ? dbError.message : 'Unknown database error'}`;
                 this.broadcast(WebSocketMessageResponses.SCREENSHOT_CAPTURE_ERROR, {
@@ -2639,7 +2646,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
 
             this.logger().info('Screenshot captured and stored successfully', { 
                 url, 
-                storage: publicUrl.startsWith('data:') ? 'database' : (publicUrl.includes('/api/screenshots/') ? 'r2' : 'images'),
+                storage: uploadedImage.publicUrl.startsWith('data:') ? 'database' : (uploadedImage.publicUrl.includes('/api/screenshots/') ? 'r2' : 'images'),
                 length: base64Screenshot.length
             });
 
@@ -2652,7 +2659,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                 timestamp: new Date().toISOString()
             });
 
-            return publicUrl;
+            return uploadedImage.publicUrl;
             
         } catch (error) {
             this.logger().error('Failed to capture screenshot via REST API:', error);
@@ -2668,144 +2675,6 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             }
             
             throw new Error(`Screenshot capture failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-    }
-
-    /**
-     * Execute a terminal command received from the frontend
-     * Uses the same infrastructure as the existing executeCommands method
-     */
-    async executeTerminalCommand(command: string, connection?: Connection): Promise<void> {
-        try {
-            this.logger().info('Executing terminal command', { command });
-            
-            // Send server log
-            const serverLogMessage = {
-                message: `Executing command: ${command}`,
-                level: 'info' as const,
-                timestamp: Date.now(),
-                source: 'terminal'
-            };
-            
-            if (connection) {
-                this.sendToConnection(connection, WebSocketMessageResponses.SERVER_LOG, serverLogMessage);
-            } else {
-                this.broadcast(WebSocketMessageResponses.SERVER_LOG, serverLogMessage);
-            }
-
-            const sanitizedCommand = command.trim();
-            if (!sanitizedCommand) {
-                throw new Error('Empty command');
-            }
-
-            const state = this.state;
-            if (!state.sandboxInstanceId) {
-                throw new Error('No sandbox instance available for executing commands');
-            }
-
-            // Use the existing sandbox service to execute the command
-            this.broadcast(WebSocketMessageResponses.COMMAND_EXECUTING, {
-                message: "Executing terminal command",
-                commands: [sanitizedCommand]
-            });
-
-            const resp = await this.getSandboxServiceClient().executeCommands(
-                state.sandboxInstanceId,
-                [sanitizedCommand]
-            );
-
-            if (!resp || !resp.results) {
-                throw new Error('Failed to execute command');
-            }
-
-            // Send the command output back to terminal
-            for (const result of resp.results) {
-                if (result.output) {
-                    const outputMessage = {
-                        output: result.output,
-                        outputType: result.success ? 'stdout' as const : 'stderr' as const,
-                        timestamp: Date.now()
-                    };
-                    
-                    if (connection) {
-                        this.sendToConnection(connection, WebSocketMessageResponses.TERMINAL_OUTPUT, outputMessage);
-                    } else {
-                        this.broadcast(WebSocketMessageResponses.TERMINAL_OUTPUT, outputMessage);
-                    }
-                }
-                
-                if (result.error) {
-                    const errorMessage = {
-                        output: result.error,
-                        outputType: 'stderr' as const,
-                        timestamp: Date.now()
-                    };
-                    
-                    if (connection) {
-                        this.sendToConnection(connection, WebSocketMessageResponses.TERMINAL_OUTPUT, errorMessage);
-                    } else {
-                        this.broadcast(WebSocketMessageResponses.TERMINAL_OUTPUT, errorMessage);
-                    }
-                }
-
-                // Show exit code if non-zero
-                if (result.exitCode !== 0) {
-                    const exitCodeMessage = {
-                        output: `Command exited with code ${result.exitCode}`,
-                        outputType: 'stderr' as const,
-                        timestamp: Date.now()
-                    };
-                    
-                    if (connection) {
-                        this.sendToConnection(connection, WebSocketMessageResponses.TERMINAL_OUTPUT, exitCodeMessage);
-                    } else {
-                        this.broadcast(WebSocketMessageResponses.TERMINAL_OUTPUT, exitCodeMessage);
-                    }
-                }
-            }
-            
-        } catch (error) {
-            this.logger().error('Error executing terminal command:', error);
-            
-            const errorMessage = {
-                output: `Error: ${error instanceof Error ? error.message : String(error)}`,
-                outputType: 'stderr' as const,
-                timestamp: Date.now()
-            };
-            
-            if (connection) {
-                this.sendToConnection(connection, WebSocketMessageResponses.TERMINAL_OUTPUT, errorMessage);
-            } else {
-                this.broadcast(WebSocketMessageResponses.TERMINAL_OUTPUT, errorMessage);
-            }
-        }
-    }
-
-    /**
-     * Send a server log message to terminals
-     */
-    broadcastServerLog(message: string, level: 'info' | 'warn' | 'error' | 'debug' = 'info', source?: string): void {
-        this.broadcast(WebSocketMessageResponses.SERVER_LOG, {
-            message,
-            level,
-            timestamp: Date.now(),
-            source
-        });
-    }
-
-    /**
-     * Send message to a specific connection
-     */
-    private sendToConnection(
-        connection: Connection, 
-        type: string, 
-        data: any
-    ): void {
-        try {
-            const message = { type, ...data };
-            connection.send(JSON.stringify(message));
-        } catch (error) {
-            this.logger().error('Error sending message to connection:', error);
         }
     }
 }
