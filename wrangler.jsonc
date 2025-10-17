@@ -147,7 +147,7 @@
         "CLOUDFLARE_AI_GATEWAY": "vibesdk-gateway",
         "CUSTOM_DOMAIN": "crowdin.app",
         "MAX_SANDBOX_INSTANCES": "10",
-        "SANDBOX_INSTANCE_TYPE": "basic",
+        "SANDBOX_INSTANCE_TYPE": "standard-1",
         "USE_CLOUDFLARE_IMAGES": false,
     },
 	"workers_dev": false,
